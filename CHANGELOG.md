@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-render-vulkan/compare/v0.0.0...v0.0.1) - 2026-10-04
+
+### Added
+
+- upload-once / draw-many GPU API for interactive viewers
+- wgpu headless GPU renderer — scanline-parity shading modes, framing, SSAA
+
 ### Added
 
 - `GpuRenderer`: wgpu-backed headless implementation of
