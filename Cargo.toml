@@ -1,0 +1,15 @@
+[package]
+name = "oxideav-render-vulkan"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "GPU-accelerated 3D-scene renderer for the oxideav framework — wgpu (Vulkan / Metal / DX12 / GL, runtime-loaded drivers) backend implementing oxideav-render's Renderer trait"
+repository = "https://github.com/OxideAV/oxideav-render-vulkan"
+homepage = "https://github.com/OxideAV/oxideav-render-vulkan"
+readme = "README.md"
+keywords = ["render", "3d", "gpu", "wgpu", "vulkan"]
+categories = ["rendering", "graphics"]
+
+[dependencies]
