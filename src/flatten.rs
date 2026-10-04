@@ -93,10 +93,8 @@ impl FlatScene {
     }
 }
 
-/// Flatten `scene`. When `wireframe` is set, triangle primitives are
-/// emitted as their three edges into the line stream instead of as
-/// filled triangles.
-pub(crate) fn flatten(scene: &Scene3D, wireframe: bool) -> FlatScene {
+/// Flatten `scene` into world-space triangle and line streams.
+pub(crate) fn flatten(scene: &Scene3D) -> FlatScene {
     let mut out = FlatScene::default();
     let mut bounds = Bounds::empty();
     walk_scene_preorder(scene, |node, world| {
@@ -115,20 +113,14 @@ pub(crate) fn flatten(scene: &Scene3D, wireframe: bool) -> FlatScene {
                 .and_then(|m| scene.materials.get(m.0 as usize))
                 .map(|m| m.base_color)
                 .unwrap_or(DEFAULT_COLOUR);
-            emit_primitive(prim, world, colour, wireframe, &mut out);
+            emit_primitive(prim, world, colour, &mut out);
         }
     });
     out.bounds = (!bounds.is_empty()).then_some(bounds);
     out
 }
 
-fn emit_primitive(
-    prim: &Primitive,
-    world: &Mat4,
-    colour: [f32; 4],
-    wireframe: bool,
-    out: &mut FlatScene,
-) {
+fn emit_primitive(prim: &Primitive, world: &Mat4, colour: [f32; 4], out: &mut FlatScene) {
     let positions: Vec<[f32; 3]> = prim
         .positions
         .iter()
@@ -161,16 +153,9 @@ fn emit_primitive(
                     vec3_sub(positions[c], positions[a]),
                 ));
                 let n = |i: usize| normals.as_ref().map_or(face, |ns| ns[i]);
-                if wireframe {
-                    for (p, q) in [(a, b), (b, c), (c, a)] {
-                        out.lines.push(vertex(p, n(p)));
-                        out.lines.push(vertex(q, n(q)));
-                    }
-                } else {
-                    out.triangles.push(vertex(a, n(a)));
-                    out.triangles.push(vertex(b, n(b)));
-                    out.triangles.push(vertex(c, n(c)));
-                }
+                out.triangles.push(vertex(a, n(a)));
+                out.triangles.push(vertex(b, n(b)));
+                out.triangles.push(vertex(c, n(c)));
             }
         }
         Topology::Lines | Topology::LineStrip | Topology::LineLoop => {

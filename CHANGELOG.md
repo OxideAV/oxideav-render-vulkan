@@ -16,3 +16,7 @@ All notable changes to this project will be documented in this file.
 - `register_into` / `BACKEND_NAME` (`"gpu"`) for `RenderRegistry`.
 - GPU-vs-scanline parity tests (skip without an adapter) and the
   `gpu_vs_cpu` example.
+- `GpuRenderer::upload` / `draw`: keep a scene resident on the GPU and
+  redraw it into an offscreen texture (`COLOR_FORMAT`, sRGB-encoded,
+  `COPY_SRC | TEXTURE_BINDING`) without readback, for interactive
+  viewers; `device()` / `queue()` accessors.

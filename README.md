@@ -28,7 +28,7 @@ oxideplay's 3D viewer does.
 | Hardware clipping and depth test | done |
 | Sharing a device with a windowed application (`GpuRenderer::from_device`) | done |
 | PBR, textures, scene lights/cameras, alpha modes (via `oxideav-render`'s scene-preparation layer) | next |
-| Render into an application-supplied texture view (for interactive viewers) | next |
+| Upload once / draw many (`upload` + `draw` → GPU texture, no readback) for interactive viewers | done |
 | Shadow maps, MSAA | planned |
 | Hardware ray tracing / GPU path tracer (ray queries) | planned |
 

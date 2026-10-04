@@ -224,3 +224,19 @@ fn registry_constructs_gpu_backend() {
     oxideav_render_vulkan::register_into(&mut reg);
     assert!(reg.names().contains(&oxideav_render_vulkan::BACKEND_NAME));
 }
+
+#[test]
+fn upload_once_draw_many() {
+    let Some(mut r) = gpu() else { return };
+    let mut gs = r.upload(&cube_scene());
+    assert_eq!(gs.triangle_count(), 12);
+    for mode in [
+        ShadingMode::Phong,
+        ShadingMode::Wireframe,
+        ShadingMode::Flat,
+    ] {
+        let tex = r.draw(&mut gs, &opts(mode)).unwrap();
+        assert_eq!((tex.width(), tex.height()), (96, 64));
+        assert_eq!(tex.format(), oxideav_render_vulkan::COLOR_FORMAT);
+    }
+}

@@ -5,13 +5,13 @@ use oxideav_render::{Error, RenderOptions, Result, RgbaImage, ShadingMode};
 use wgpu::util::DeviceExt;
 
 use crate::camera::{light_direction, view_proj};
-use crate::flatten::{flatten, Vertex};
+use crate::flatten::{flatten, Bounds, Vertex};
 use crate::math::to_column_major;
 use crate::GpuBackend;
 
 /// Colour target format. Plain UNORM: the fragment shader performs
 /// the sRGB encode itself (see `shaders/scene.wgsl`).
-const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+pub(crate) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Ambient term — identical to the scanline backend's.
 const AMBIENT: f32 = 0.2;
@@ -218,7 +218,9 @@ impl GpuContext {
             };
             let color = tex(
                 COLOR_FORMAT,
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 "color",
             );
             let depth = tex(
@@ -236,29 +238,63 @@ impl GpuContext {
         }
     }
 
-    pub(crate) fn render(
-        &mut self,
-        scene: &oxideav_mesh3d::Scene3D,
-        opts: &RenderOptions,
-    ) -> Result<RgbaImage> {
-        let width = opts.width.max(1);
-        let height = opts.height.max(1);
+    /// Upload `scene` (flattened to world space) into GPU vertex
+    /// buffers. The result can be drawn any number of times with
+    /// different options; wireframe edges are derived on first use.
+    pub(crate) fn upload(&self, scene: &oxideav_mesh3d::Scene3D) -> GpuScene {
+        let flat = flatten(scene);
+        let bounds = flat.bounds_or_unit();
+        GpuScene {
+            triangles: self.vertex_buffer(&flat.triangles, "triangles"),
+            lines: self.vertex_buffer(&flat.lines, "lines"),
+            edges: None,
+            cpu_triangles: flat.triangles,
+            bounds,
+        }
+    }
+
+    fn vertex_buffer(&self, data: &[Vertex], label: &str) -> Option<(wgpu::Buffer, u32)> {
+        (!data.is_empty()).then(|| {
+            let buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            (buf, data.len() as u32)
+        })
+    }
+
+    fn check_size(&self, width: u32, height: u32) -> Result<()> {
         if width > self.max_dim || height > self.max_dim {
             return Err(Error::InvalidOptions(format!(
                 "{width}x{height} exceeds the GPU's {} max texture dimension",
                 self.max_dim
             )));
         }
-        // Supersample like the scanline backend, shrinking the factor
-        // when the enlarged target would exceed the device limit.
-        let mut aa = opts.aa.clamp(1, 8);
-        while aa > 1 && (width * aa > self.max_dim || height * aa > self.max_dim) {
-            aa -= 1;
-        }
-        let (rw, rh) = (width * aa, height * aa);
+        Ok(())
+    }
 
+    /// Record the scene pass into `encoder`, targeting the cached
+    /// offscreen targets (resized to `width × height`).
+    fn encode_scene(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        gs: &mut GpuScene,
+        opts: &RenderOptions,
+        width: u32,
+        height: u32,
+    ) {
         let wireframe = opts.shading == ShadingMode::Wireframe;
-        let flat = flatten(scene, wireframe);
+        if wireframe && gs.edges.is_none() {
+            let edges: Vec<Vertex> = gs
+                .cpu_triangles
+                .chunks_exact(3)
+                .flat_map(|t| [t[0], t[1], t[1], t[2], t[2], t[0]])
+                .collect();
+            gs.edges = Some(self.vertex_buffer(&edges, "edges"));
+        }
         let mode = match opts.shading {
             ShadingMode::Flat => 0,
             ShadingMode::Gouraud => 1,
@@ -272,19 +308,19 @@ impl GpuContext {
         };
         let light = light_direction(opts);
         let globals = Globals {
-            view_proj: to_column_major(&view_proj(rw, rh, flat.bounds_or_unit(), opts)),
+            view_proj: to_column_major(&view_proj(width, height, gs.bounds, opts)),
             light: [light[0], light[1], light[2], opts.light.intensity.max(0.0)],
             params: [AMBIENT, 0.0, 0.0, 0.0],
             mode: [mode, 0, 0, 0],
         };
-
-        let device = self.device.clone();
-        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("globals"),
-            contents: bytemuck::bytes_of(&globals),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let uniform = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("globals"),
+                contents: bytemuck::bytes_of(&globals),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
             layout: &self.bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
@@ -292,74 +328,117 @@ impl GpuContext {
                 resource: uniform.as_entire_binding(),
             }],
         });
-        let vbuf = |data: &[Vertex], label| {
-            (!data.is_empty()).then(|| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(label),
-                    contents: bytemuck::cast_slice(data),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-            })
+
+        self.ensure_targets(width, height);
+        let targets = self.targets.as_ref().expect("targets ensured above");
+        let bg = opts.background.0.map(|c| c as f64 / 255.0);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &targets.color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: bg[0],
+                        g: bg[1],
+                        b: bg[2],
+                        a: bg[3],
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &targets.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_bind_group(0, &bind_group, &[]);
+        let fill = if wireframe {
+            None
+        } else {
+            gs.triangles.as_ref()
         };
-        let tri_buf = vbuf(&flat.triangles, "triangles");
-        let line_buf = vbuf(&flat.lines, "lines");
+        if let Some((buf, n)) = fill {
+            pass.set_pipeline(&self.tri_pipeline);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..*n, 0..1);
+        }
+        let wire = if wireframe {
+            gs.edges.as_ref().and_then(Option::as_ref)
+        } else {
+            None
+        };
+        for (buf, n) in wire.into_iter().chain(gs.lines.as_ref()) {
+            pass.set_pipeline(&self.line_pipeline);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..*n, 0..1);
+        }
+    }
+
+    /// Draw an uploaded scene into the offscreen colour texture at
+    /// `opts.width × opts.height` (no supersampling, no readback) and
+    /// return that texture. Format is [`COLOR_FORMAT`] holding
+    /// sRGB-encoded values; usable as a copy source or sampled
+    /// texture.
+    pub(crate) fn draw(
+        &mut self,
+        gs: &mut GpuScene,
+        opts: &RenderOptions,
+    ) -> Result<&wgpu::Texture> {
+        let (width, height) = (opts.width.max(1), opts.height.max(1));
+        self.check_size(width, height)?;
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.encode_scene(&mut encoder, gs, opts, width, height);
+        self.queue.submit([encoder.finish()]);
+        Ok(&self
+            .targets
+            .as_ref()
+            .expect("targets ensured by encode_scene")
+            .color)
+    }
+
+    pub(crate) fn render(
+        &mut self,
+        scene: &oxideav_mesh3d::Scene3D,
+        opts: &RenderOptions,
+    ) -> Result<RgbaImage> {
+        let width = opts.width.max(1);
+        let height = opts.height.max(1);
+        self.check_size(width, height)?;
+        // Supersample like the scanline backend, shrinking the factor
+        // when the enlarged target would exceed the device limit.
+        let mut aa = opts.aa.clamp(1, 8);
+        while aa > 1 && (width * aa > self.max_dim || height * aa > self.max_dim) {
+            aa -= 1;
+        }
+        let (rw, rh) = (width * aa, height * aa);
+
+        let mut gs = self.upload(scene);
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.encode_scene(&mut encoder, &mut gs, opts, rw, rh);
 
         // Readback buffer rows must be 256-byte aligned.
         let unpadded = rw as usize * 4;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
         let padded = unpadded.div_ceil(align) * align;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: (padded * rh as usize) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-
-        let bg = opts.background.0.map(|c| c as f64 / 255.0);
-        let mut encoder = device.create_command_encoder(&Default::default());
-        self.ensure_targets(rw, rh);
-        let targets = self.targets.as_ref().expect("targets ensured above");
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg[0],
-                            g: bg[1],
-                            b: bg[2],
-                            a: bg[3],
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &targets.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &bind_group, &[]);
-            if let Some(buf) = &tri_buf {
-                pass.set_pipeline(&self.tri_pipeline);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..flat.triangles.len() as u32, 0..1);
-            }
-            if let Some(buf) = &line_buf {
-                pass.set_pipeline(&self.line_pipeline);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..flat.lines.len() as u32, 0..1);
-            }
-        }
+        let targets = self
+            .targets
+            .as_ref()
+            .expect("targets ensured by encode_scene");
         encoder.copy_texture_to_buffer(
             targets.color.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -383,7 +462,7 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        device
+        self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| backend_err("poll", e))?;
         rx.recv()
@@ -409,6 +488,30 @@ impl GpuContext {
         } else {
             downsample_box(&full, width, height, aa)
         })
+    }
+
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+}
+
+/// A scene resident in GPU memory (see [`GpuContext::upload`]).
+pub(crate) struct GpuScene {
+    triangles: Option<(wgpu::Buffer, u32)>,
+    lines: Option<(wgpu::Buffer, u32)>,
+    /// Wireframe edge list, built on the first wireframe draw.
+    edges: Option<Option<(wgpu::Buffer, u32)>>,
+    cpu_triangles: Vec<Vertex>,
+    bounds: Bounds,
+}
+
+impl GpuScene {
+    pub(crate) fn triangle_count(&self) -> usize {
+        self.cpu_triangles.len() / 3
     }
 }
 

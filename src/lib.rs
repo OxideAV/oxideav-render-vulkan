@@ -49,6 +49,28 @@ pub use oxideav_render::Error;
 /// Crate identifier.
 pub const CRATE_NAME: &str = "oxideav-render-vulkan";
 
+/// Format of the texture returned by [`GpuRenderer::draw`]. Holds
+/// sRGB-encoded values despite the UNORM format.
+pub const COLOR_FORMAT: wgpu::TextureFormat = gpu::COLOR_FORMAT;
+
+/// A scene resident in GPU memory, created by [`GpuRenderer::upload`].
+pub struct GpuScene(gpu::GpuScene);
+
+impl GpuScene {
+    /// Number of triangles uploaded.
+    pub fn triangle_count(&self) -> usize {
+        self.0.triangle_count()
+    }
+}
+
+impl std::fmt::Debug for GpuScene {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuScene")
+            .field("triangles", &self.triangle_count())
+            .finish()
+    }
+}
+
 /// Name under which [`register_into`] registers the GPU backend.
 pub const BACKEND_NAME: &str = "gpu";
 
@@ -102,6 +124,34 @@ impl GpuRenderer {
         Self {
             ctx: gpu::GpuContext::from_device(device, queue, info),
         }
+    }
+
+    /// Upload `scene` to GPU memory once so it can be redrawn cheaply
+    /// with different options (interactive viewers: orbit, zoom,
+    /// shading-mode switches). Re-upload when the scene changes.
+    pub fn upload(&self, scene: &oxideav_mesh3d::Scene3D) -> GpuScene {
+        GpuScene(self.ctx.upload(scene))
+    }
+
+    /// Draw an uploaded scene at `opts.width × opts.height` into the
+    /// renderer's offscreen colour texture and return it — no
+    /// supersampling, no CPU readback. The texture has format
+    /// [`COLOR_FORMAT`] and holds **sRGB-encoded** values (the shader
+    /// encodes); it supports `COPY_SRC` and `TEXTURE_BINDING`, so a
+    /// viewer can copy or sample it onto its surface. The work is
+    /// submitted to [`GpuRenderer::queue`] before returning.
+    pub fn draw(&mut self, scene: &mut GpuScene, opts: &RenderOptions) -> Result<&wgpu::Texture> {
+        self.ctx.draw(&mut scene.0, opts)
+    }
+
+    /// The wgpu device the renderer draws with.
+    pub fn device(&self) -> &wgpu::Device {
+        self.ctx.device()
+    }
+
+    /// The wgpu queue the renderer submits to.
+    pub fn queue(&self) -> &wgpu::Queue {
+        self.ctx.queue()
     }
 
     /// Human-readable adapter description: `"<name> (<device type>,
