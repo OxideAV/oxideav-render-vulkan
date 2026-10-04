@@ -3,6 +3,8 @@
 //! so they must agree statistically — in practice to within float
 //! rounding. Every test skips without an adapter.
 
+mod common;
+
 use std::sync::Arc;
 
 use oxideav_mesh3d::{
@@ -18,6 +20,9 @@ use oxideav_render::{
 use oxideav_render_vulkan::{GpuMode, GpuPathTracer, GpuRenderer};
 
 fn gpu() -> Option<GpuPathTracer> {
+    if !common::gpu_tests_enabled() {
+        return None;
+    }
     match GpuPathTracer::new() {
         Ok(g) => Some(g),
         Err(e) => {
@@ -551,6 +556,9 @@ fn empty_scene_is_all_background() {
 fn gl_backend_runs_or_fails_cleanly() {
     // GL / GLES adapters may lack compute shaders: the tracer must then
     // report Error::Backend instead of panicking.
+    if !common::gpu_tests_enabled() {
+        return;
+    }
     match GpuPathTracer::with_backend(oxideav_render_vulkan::GpuBackend::Gl) {
         Ok(mut g) => {
             let scene = testscenes::cornell_box();

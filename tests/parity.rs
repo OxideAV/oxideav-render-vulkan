@@ -1,6 +1,8 @@
 //! GPU `Pbr` vs scanline `Pbr` parity on oxideav-render's shared
 //! procedural test scenes. Skips without an adapter.
 
+mod common;
+
 use oxideav_mesh3d::{Sampler, Scene3D};
 use oxideav_render::testscenes::{self, mean_abs_error, psnr};
 use oxideav_render::{
@@ -21,6 +23,9 @@ fn opts() -> RenderOptions {
 }
 
 fn compare(name: &str, scene: &Scene3D, o: &RenderOptions, min_psnr: f64) {
+    if !common::gpu_tests_enabled() {
+        return;
+    }
     let Ok(mut gpu) = GpuRenderer::new() else {
         eprintln!("skipping GPU parity test");
         return;
@@ -112,6 +117,9 @@ fn normal_mapped_quad() {
 
 #[test]
 fn shadows_darken_the_floor() {
+    if !common::gpu_tests_enabled() {
+        return;
+    }
     let Ok(mut gpu) = GpuRenderer::new() else {
         return;
     };
@@ -136,6 +144,9 @@ fn shadows_darken_the_floor() {
 
 #[test]
 fn hdr_matches_scanline_hdr() {
+    if !common::gpu_tests_enabled() {
+        return;
+    }
     let Ok(mut gpu) = GpuRenderer::new() else {
         return;
     };

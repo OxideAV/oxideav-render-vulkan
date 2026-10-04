@@ -149,11 +149,7 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
 impl GpuContext {
     /// Open an adapter + device headlessly (no surface).
     pub(crate) fn new(backend: GpuBackend) -> Result<Self> {
-        pollster::block_on(Self::new_async(backend))
-    }
-
-    async fn new_async(backend: GpuBackend) -> Result<Self> {
-        let (device, queue, info) = open_device(backend).await?;
+        let (device, queue, info) = open_device_blocking(backend)?;
         Ok(Self::from_device(device, queue, info))
     }
 
@@ -964,12 +960,32 @@ impl GpuContext {
     }
 }
 
-/// Open an adapter + device headlessly (no surface): downlevel limits
-/// raised to the adapter's texture size and storage-buffer limits
-/// (the path tracer binds the whole scene as storage buffers).
-pub(crate) async fn open_device(
+/// Serialises instance / adapter / device creation process-wide. Some
+/// drivers (seen with NVIDIA's Vulkan ICD and with WARP on Windows)
+/// crash when several threads create and drop instances or devices
+/// concurrently — e.g. a test harness opening one renderer per test
+/// thread. Creation is rare and cheap next to rendering, so a global
+/// lock costs nothing in practice.
+pub(crate) static DEVICE_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`open_device`] under [`DEVICE_INIT`].
+pub(crate) fn open_device_blocking(
     backend: GpuBackend,
 ) -> Result<(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo)> {
+    let _guard = DEVICE_INIT.lock().unwrap_or_else(|e| e.into_inner());
+    pollster::block_on(open_device(backend))
+}
+
+/// Adapter info for [`request_adapter`] under [`DEVICE_INIT`].
+pub(crate) fn probe_blocking(backend: GpuBackend) -> Option<wgpu::AdapterInfo> {
+    let _guard = DEVICE_INIT.lock().unwrap_or_else(|e| e.into_inner());
+    pollster::block_on(request_adapter(backend))
+        .ok()
+        .map(|a| a.get_info())
+}
+
+/// Pick the adapter `open_device` would use (no device is created).
+pub(crate) async fn request_adapter(backend: GpuBackend) -> Result<wgpu::Adapter> {
     let backends = match backend {
         GpuBackend::Auto => wgpu::Backends::all(),
         GpuBackend::Vulkan => wgpu::Backends::VULKAN,
@@ -984,14 +1000,23 @@ pub(crate) async fn open_device(
         backend_options: wgpu::BackendOptions::default(),
         display: None,
     });
-    let adapter = instance
+    instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
         })
         .await
-        .map_err(|e| backend_err("no suitable adapter", e))?;
+        .map_err(|e| backend_err("no suitable adapter", e))
+}
+
+/// Open an adapter + device headlessly (no surface): downlevel limits
+/// raised to the adapter's texture size and storage-buffer limits
+/// (the path tracer binds the whole scene as storage buffers).
+pub(crate) async fn open_device(
+    backend: GpuBackend,
+) -> Result<(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo)> {
+    let adapter = request_adapter(backend).await?;
     let al = adapter.limits();
     let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(al.clone());
     limits.max_storage_buffer_binding_size = limits

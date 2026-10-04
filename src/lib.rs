@@ -299,6 +299,15 @@ impl Renderer for GpuRenderer {
     }
 }
 
+/// Describe the adapter [`GpuRenderer::with_backend`] would open for
+/// `backend`, without creating a device. `None` when no adapter is
+/// available. Lets callers (and test suites) inspect the device type —
+/// e.g. tell a hardware GPU from a software rasteriser such as WARP or
+/// llvmpipe (`wgpu::DeviceType::Cpu`) — before committing to it.
+pub fn probe_adapter(backend: GpuBackend) -> Option<wgpu::AdapterInfo> {
+    gpu::probe_blocking(backend)
+}
+
 /// Register the GPU backends into `registry`: the rasteriser under
 /// [`BACKEND_NAME`] and the path tracer under
 /// [`PATHTRACE_BACKEND_NAME`]. The factories open the device lazily,

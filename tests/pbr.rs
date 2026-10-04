@@ -1,6 +1,8 @@
 //! Physically based (`ShadingMode::Pbr`) GPU tests. Each skips when no
 //! adapter is available.
 
+mod common;
+
 use std::sync::Arc;
 
 use oxideav_mesh3d::{
@@ -14,6 +16,9 @@ use oxideav_render_vulkan::GpuRenderer;
 const BG: [u8; 4] = [10, 20, 30, 255];
 
 fn gpu() -> Option<GpuRenderer> {
+    if !common::gpu_tests_enabled() {
+        return None;
+    }
     GpuRenderer::new()
         .map_err(|e| eprintln!("skipping GPU test: {e}"))
         .ok()

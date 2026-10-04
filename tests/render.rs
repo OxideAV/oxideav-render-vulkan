@@ -1,6 +1,8 @@
 //! GPU render tests. Every test skips (passes with a note) when the
 //! machine has no usable adapter, so CI without a GPU stays green.
 
+mod common;
+
 use oxideav_mesh3d::{Material, MaterialId, Mesh, MeshId, Node, Primitive, Scene3D, Topology};
 use oxideav_render::{
     make_renderer, BackgroundColor, CameraSpec, RenderBackend, RenderOptions, Renderer, RgbaImage,
@@ -9,6 +11,9 @@ use oxideav_render::{
 use oxideav_render_vulkan::GpuRenderer;
 
 fn gpu() -> Option<GpuRenderer> {
+    if !common::gpu_tests_enabled() {
+        return None;
+    }
     match GpuRenderer::new() {
         Ok(r) => {
             eprintln!("using {}", r.adapter_summary());

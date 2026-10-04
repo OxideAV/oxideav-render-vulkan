@@ -313,7 +313,7 @@ impl GpuPathTracer {
 
     /// Open a GPU through a specific API.
     pub fn with_backend(backend: crate::GpuBackend) -> Result<Self> {
-        let (device, queue, info) = pollster::block_on(crate::gpu::open_device(backend))?;
+        let (device, queue, info) = crate::gpu::open_device_blocking(backend)?;
         Self::from_device(device, queue, info)
     }
 
