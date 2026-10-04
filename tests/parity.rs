@@ -160,3 +160,19 @@ fn hdr_matches_scanline_hdr() {
     eprintln!("hdr MAE {mae:.5}, max value {max}");
     assert!(mae < 0.01, "HDR mean abs error {mae}");
 }
+
+/// Auto-framed (no scene camera) textured quad: pixel centres land
+/// exactly on the shared diagonal, which once dropped out on the CPU.
+#[test]
+fn textured_quad_auto_framed() {
+    let o = RenderOptions {
+        scene_camera: None,
+        ..opts()
+    };
+    compare(
+        "textured-auto",
+        &testscenes::textured_quad(Sampler::default()),
+        &o,
+        50.0,
+    );
+}
