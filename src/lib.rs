@@ -205,6 +205,10 @@ impl Renderer for GpuRenderer {
     ) -> Result<HdrImage> {
         self.ctx.render_hdr(scene, opts)
     }
+
+    fn set_texture_resolver(&mut self, resolver: std::sync::Arc<dyn TextureResolver>) {
+        self.ctx.texture_cache_mut().set_resolver(resolver);
+    }
 }
 
 /// Register the GPU backend into `registry` under [`BACKEND_NAME`].

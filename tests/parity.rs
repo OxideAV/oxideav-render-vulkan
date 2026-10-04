@@ -176,3 +176,21 @@ fn textured_quad_auto_framed() {
         50.0,
     );
 }
+
+/// Pan offset and orthographic zoom come from the shared camera, so
+/// both backends must agree on them too.
+#[test]
+fn pan_and_ortho_zoom_match() {
+    let o = RenderOptions {
+        scene_camera: None,
+        projection: oxideav_render::Projection::Orthographic,
+        camera: Some(oxideav_render::CameraSpec {
+            elevation_deg: 25.0,
+            azimuth_deg: 30.0,
+            distance: 1.6,
+        }),
+        camera_target_offset: [0.3, -0.2, 0.0],
+        ..opts()
+    };
+    compare("pan-ortho", &testscenes::sphere_grid(4, 3), &o, 40.0);
+}
