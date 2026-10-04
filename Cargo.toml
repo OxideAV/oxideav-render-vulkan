@@ -2,7 +2,7 @@
 name = "oxideav-render-vulkan"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.87"
 license = "MIT"
 authors = ["Mark Karpeles"]
 description = "GPU-accelerated 3D-scene renderer for the oxideav framework — wgpu (Vulkan / Metal / DX12 / GL, runtime-loaded drivers) backend implementing oxideav-render's Renderer trait"
@@ -12,4 +12,20 @@ readme = "README.md"
 keywords = ["render", "3d", "gpu", "wgpu", "vulkan"]
 categories = ["rendering", "graphics"]
 
+[features]
+default = []
+
 [dependencies]
+# Renderer trait, RenderOptions, RgbaImage, RenderRegistry. Pulled
+# without its `registry` feature: this crate stays out of the
+# framework's default tree and is only linked on demand (e.g. by
+# oxideplay's 3D viewer).
+oxideav-render = { version = "0.0", default-features = false }
+oxideav-mesh3d = { version = "0.0", default-features = false }
+# wgpu dlopens the system Vulkan / GL / Metal / DX12 drivers at
+# runtime, so no graphics SDK is needed at build time. Same major as
+# oxideplay's winit/wgpu video output so both share one copy.
+# WGSL shaders are compiled by wgpu's bundled naga.
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
