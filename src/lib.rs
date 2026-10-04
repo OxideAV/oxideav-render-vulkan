@@ -30,9 +30,17 @@
 //!   punctual lights (`KHR_lights_punctual` falloff), ambient, exposure
 //!   and tone mapping;
 //! * a scene-linear `Rgba16Float` pass resolved (tone map, background
-//!   composite, supersample average, sRGB encode) on the GPU.
-//!
-//! Shadow maps and hardware ray tracing are later phases.
+//!   composite, supersample average, sRGB encode) on the GPU;
+//! * shadow maps for directional / spot lights;
+//! * [`GpuPathTracer`]: a compute-shader port of oxideav-render's
+//!   unbiased path tracer ([`oxideav_render::PathTracer`]) — same
+//!   estimator, same random sequences, same progressive API and reset
+//!   rules — with a software BVH traversal in WGSL. Select it with
+//!   [`GpuRenderer::set_mode`]`(`[`GpuMode::PathTrace`]`)`, use it
+//!   directly, or make it from a registry as
+//!   [`PATHTRACE_BACKEND_NAME`]. Hardware ray queries are out of scope:
+//!   wgpu only enables them through an `unsafe` call, and this crate
+//!   forbids `unsafe`.
 //!
 //! ```no_run
 //! use oxideav_render::{RenderOptions, Renderer};
@@ -42,6 +50,22 @@
 //! let mut gpu = GpuRenderer::new()?;
 //! let image = gpu.render(scene, &RenderOptions::default())?;
 //! # let _ = image; Ok(()) }
+//! ```
+//!
+//! Progressive path tracing (e.g. one `refine` per UI frame):
+//!
+//! ```no_run
+//! use oxideav_render::RenderOptions;
+//! use oxideav_render_vulkan::GpuRenderer;
+//!
+//! # fn demo(scene: &oxideav_mesh3d::Scene3D) -> oxideav_render::Result<()> {
+//! let mut gpu = GpuRenderer::new()?;
+//! let opts = RenderOptions::default();
+//! let pt = gpu.path_tracer()?;
+//! pt.sync(scene, &opts)?; // re-uploads / resets only when needed
+//! pt.refine(4)?; // queued compute dispatches
+//! let texture = pt.draw_texture()?; // COLOR_FORMAT, no readback
+//! # let _ = texture; Ok(()) }
 //! ```
 
 #![deny(missing_docs)]

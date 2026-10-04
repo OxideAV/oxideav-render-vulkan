@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `GpuPathTracer`: a wgpu compute-shader port of oxideav-render's
+  unbiased path tracer. It follows the CPU estimator spec
+  (`oxideav_render::pathtrace` §1–5): the same PCG / Owen-scrambled
+  Sobol' sequences and dimension layout, NEE to punctual lights plus
+  one emissive-triangle (Arvo spherical-triangle sampling) or
+  environment sample, power-heuristic MIS, Russian roulette,
+  stochastic BLEND coins, and the layered glTF BSDF (transmission,
+  volume, clearcoat, sheen). Its images match the CPU tracer to float
+  rounding (63–85 dB PSNR at 64 spp).
+- Software BVH traversal in WGSL over `TraceScene`'s SAH BVH, using
+  four storage buffers. Textures go into an `Rgba16Float` array-texture
+  atlas, filtered manually so the result matches the CPU sampler.
+- Progressive API: `sync` / `refine` / `samples` / `is_converged` /
+  `image` / `hdr` / `draw_texture` (no readback) / `finish` /
+  `set_environment` / `invalidate_scene` / `reset`, with the CPU
+  `PathTracer`'s reset rules. It implements `Renderer` (`render` and
+  `render_hdr` take `samples_per_pixel` samples).
+- `GpuMode` and `GpuRenderer::set_mode` / `mode` / `path_tracer`. The
+  path tracer is registered as `"gpu-pathtrace"`
+  (`PATHTRACE_BACKEND_NAME`) next to `"gpu"`.
+- `tests/pathtrace.rs` (GPU-vs-CPU parity suite), the `pt_bench`
+  example and `BENCHMARKS.md`. The Cornell box at 256², 64 spp renders
+  in 32 ms on an RTX 5080, against 281 ms for the CPU tracer.
+
 - `GpuRenderer`: wgpu-backed headless implementation of
   `oxideav_render::Renderer` (runtime-loaded Vulkan / Metal / DX12 / GL).
   Covers the scanline backend's shading modes (Flat, Gouraud, Phong,
@@ -44,5 +68,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- `GpuRenderer::new` / `with_backend` now request the adapter's
+  storage-buffer binding size, buffer size and storage-buffer count
+  (up to 8), on top of the downlevel defaults. The `upload` / `draw`
+  signatures are unchanged.
 - `GpuRenderer::upload` takes `&mut self` and `&RenderOptions` (for
   time / animation / material variant).

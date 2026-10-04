@@ -91,6 +91,8 @@ const PATHS_PER_DISPATCH: u64 = 1 << 20;
 const PATHS_PER_SUBMIT: u64 = 1 << 22;
 /// Dynamic-offset stride of the per-dispatch uniform.
 const FRAME_SLOT: u64 = 256;
+/// Dispatches per per-dispatch-uniform buffer.
+const FRAMES_PER_BUFFER: usize = 1024;
 const MAT_STRIDE: usize = 136;
 const MAT_SLOTS: usize = 32;
 const NONE: u32 = u32::MAX;
@@ -603,52 +605,56 @@ impl GpuPathTracer {
             }
             first += count;
         }
-        let mut bytes = vec![0u8; frames.len() * FRAME_SLOT as usize];
-        for (i, f) in frames.iter().enumerate() {
-            let at = i * FRAME_SLOT as usize;
-            bytes[at..at + 16].copy_from_slice(bytemuck::bytes_of(f));
-        }
-        let fbuf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pt frames"),
-                contents: &bytes,
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let fgroup = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pt frames"),
-            layout: &self.frame_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &fbuf,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(16),
-                }),
-            }],
-        });
         let scene_group = self.binding.as_ref().expect("ensured");
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut pending = 0u64;
-        for (i, f) in frames.iter().enumerate() {
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pt trace"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.trace_pipeline);
-                pass.set_bind_group(0, scene_group, &[]);
-                pass.set_bind_group(1, &fgroup, &[(i as u64 * FRAME_SLOT) as u32]);
-                pass.dispatch_workgroups(w.div_ceil(8), f.rows.div_ceil(8), 1);
+        // One small uniform buffer of per-dispatch parameters per
+        // chunk keeps memory bounded for huge `samples`.
+        for chunk in frames.chunks(FRAMES_PER_BUFFER) {
+            let mut bytes = vec![0u8; chunk.len() * FRAME_SLOT as usize];
+            for (i, f) in chunk.iter().enumerate() {
+                let at = i * FRAME_SLOT as usize;
+                bytes[at..at + 16].copy_from_slice(bytemuck::bytes_of(f));
             }
-            pending += w as u64 * f.rows as u64 * f.count as u64;
-            if pending >= PATHS_PER_SUBMIT {
-                let done = std::mem::replace(
-                    &mut encoder,
-                    self.device.create_command_encoder(&Default::default()),
-                );
-                self.queue.submit([done.finish()]);
-                pending = 0;
+            let fbuf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("pt frames"),
+                    contents: &bytes,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let fgroup = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pt frames"),
+                layout: &self.frame_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &fbuf,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(16),
+                    }),
+                }],
+            });
+            for (i, f) in chunk.iter().enumerate() {
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("pt trace"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.trace_pipeline);
+                    pass.set_bind_group(0, scene_group, &[]);
+                    pass.set_bind_group(1, &fgroup, &[(i as u64 * FRAME_SLOT) as u32]);
+                    pass.dispatch_workgroups(w.div_ceil(8), f.rows.div_ceil(8), 1);
+                }
+                pending += w as u64 * f.rows as u64 * f.count as u64;
+                if pending >= PATHS_PER_SUBMIT {
+                    let done = std::mem::replace(
+                        &mut encoder,
+                        self.device.create_command_encoder(&Default::default()),
+                    );
+                    self.queue.submit([done.finish()]);
+                    pending = 0;
+                }
             }
         }
         self.queue.submit([encoder.finish()]);
