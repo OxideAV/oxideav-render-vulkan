@@ -241,7 +241,7 @@ impl ResourceCache {
 
 /// IEEE 754 binary32 → binary16 bits, round-to-nearest-even, with
 /// overflow to infinity, subnormals, and NaN preserved.
-fn f32_to_f16(v: f32) -> u16 {
+pub(crate) fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;

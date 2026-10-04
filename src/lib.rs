@@ -48,8 +48,11 @@
 #![forbid(unsafe_code)]
 
 mod gpu;
+mod pathtrace;
 mod scene;
 mod shadow;
+
+pub use pathtrace::{GpuMode, GpuPathTracer};
 
 use oxideav_render::{
     HdrImage, RenderOptions, RenderRegistry, Renderer, Result, RgbaImage, TextureResolver,
@@ -82,8 +85,12 @@ impl std::fmt::Debug for GpuScene {
     }
 }
 
-/// Name under which [`register_into`] registers the GPU backend.
+/// Name under which [`register_into`] registers the GPU rasteriser.
 pub const BACKEND_NAME: &str = "gpu";
+
+/// Name under which [`register_into`] registers the GPU path tracer
+/// ([`GpuPathTracer`]).
+pub const PATHTRACE_BACKEND_NAME: &str = "gpu-pathtrace";
 
 /// Which wgpu backend to open.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,14 +111,25 @@ pub enum GpuBackend {
 
 /// GPU renderer. Owns a wgpu device plus compiled pipelines; reuse one
 /// instance across frames to avoid re-initialising the device.
+///
+/// [`GpuRenderer::set_mode`] switches `render` / `render_hdr` between
+/// the rasteriser ([`GpuMode::Raster`], the default) and the compute
+/// path tracer ([`GpuMode::PathTrace`]) sharing the same device.
+/// [`GpuRenderer::upload`] / [`GpuRenderer::draw`] always rasterise;
+/// interactive path tracing goes through
+/// [`GpuRenderer::path_tracer`].
 pub struct GpuRenderer {
     ctx: gpu::GpuContext,
+    mode: GpuMode,
+    pt: Option<GpuPathTracer>,
+    resolver: Option<std::sync::Arc<dyn TextureResolver>>,
 }
 
 impl std::fmt::Debug for GpuRenderer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GpuRenderer")
             .field("adapter", &self.adapter_summary())
+            .field("mode", &self.mode)
             .finish()
     }
 }
@@ -124,17 +142,53 @@ impl GpuRenderer {
 
     /// Open a GPU through a specific API.
     pub fn with_backend(backend: GpuBackend) -> Result<Self> {
-        Ok(Self {
-            ctx: gpu::GpuContext::new(backend)?,
-        })
+        Ok(Self::wrap(gpu::GpuContext::new(backend)?))
     }
 
     /// Build the renderer on an existing wgpu device — lets a windowed
     /// application (e.g. oxideplay) share its device with the renderer.
     pub fn from_device(device: wgpu::Device, queue: wgpu::Queue, info: wgpu::AdapterInfo) -> Self {
+        Self::wrap(gpu::GpuContext::from_device(device, queue, info))
+    }
+
+    fn wrap(ctx: gpu::GpuContext) -> Self {
         Self {
-            ctx: gpu::GpuContext::from_device(device, queue, info),
+            ctx,
+            mode: GpuMode::Raster,
+            pt: None,
+            resolver: None,
         }
+    }
+
+    /// Select what [`Renderer::render`] / [`Renderer::render_hdr`]
+    /// run: the rasteriser or the path tracer (which takes
+    /// `opts.path_trace.samples_per_pixel` samples per call).
+    pub fn set_mode(&mut self, mode: GpuMode) {
+        self.mode = mode;
+    }
+
+    /// The current [`GpuMode`].
+    pub fn mode(&self) -> GpuMode {
+        self.mode
+    }
+
+    /// The path tracer on this renderer's device, created on first use
+    /// (for progressive `sync` / `refine` / `draw_texture` in viewers).
+    /// Fails with [`Error::Backend`] when the device cannot run
+    /// compute shaders.
+    pub fn path_tracer(&mut self) -> Result<&mut GpuPathTracer> {
+        if self.pt.is_none() {
+            let mut pt = GpuPathTracer::from_device(
+                self.ctx.device().clone(),
+                self.ctx.queue().clone(),
+                self.ctx.adapter_info().clone(),
+            )?;
+            if let Some(r) = &self.resolver {
+                pt.set_texture_resolver(r.clone());
+            }
+            self.pt = Some(pt);
+        }
+        Ok(self.pt.as_mut().expect("created above"))
     }
 
     /// Upload `scene` to GPU memory once so it can be redrawn cheaply
@@ -153,7 +207,11 @@ impl GpuRenderer {
     /// codec registry). Without one, only raw `RAW_RGBA8_MIME`
     /// payloads decode and other textured materials render untextured.
     pub fn set_texture_resolver(&mut self, resolver: std::sync::Arc<dyn TextureResolver>) {
-        self.ctx.texture_cache_mut().set_resolver(resolver);
+        if let Some(pt) = &mut self.pt {
+            pt.set_texture_resolver(resolver.clone());
+        }
+        self.ctx.texture_cache_mut().set_resolver(resolver.clone());
+        self.resolver = Some(resolver);
     }
 
     /// Draw an uploaded scene at `opts.width × opts.height`
@@ -191,7 +249,10 @@ impl Renderer for GpuRenderer {
         scene: &oxideav_mesh3d::Scene3D,
         opts: &RenderOptions,
     ) -> Result<RgbaImage> {
-        self.ctx.render(scene, opts)
+        match self.mode {
+            GpuMode::PathTrace => self.path_tracer()?.render(scene, opts),
+            GpuMode::Raster => self.ctx.render(scene, opts),
+        }
     }
 
     /// Native float path: scene-linear radiance resolved on the GPU
@@ -203,20 +264,28 @@ impl Renderer for GpuRenderer {
         scene: &oxideav_mesh3d::Scene3D,
         opts: &RenderOptions,
     ) -> Result<HdrImage> {
-        self.ctx.render_hdr(scene, opts)
+        match self.mode {
+            GpuMode::PathTrace => self.path_tracer()?.render_hdr(scene, opts),
+            GpuMode::Raster => self.ctx.render_hdr(scene, opts),
+        }
     }
 
     fn set_texture_resolver(&mut self, resolver: std::sync::Arc<dyn TextureResolver>) {
-        self.ctx.texture_cache_mut().set_resolver(resolver);
+        GpuRenderer::set_texture_resolver(self, resolver);
     }
 }
 
-/// Register the GPU backend into `registry` under [`BACKEND_NAME`].
-/// The factory opens the device lazily, on each `make` call, so
-/// registration itself never touches the GPU.
+/// Register the GPU backends into `registry`: the rasteriser under
+/// [`BACKEND_NAME`] and the path tracer under
+/// [`PATHTRACE_BACKEND_NAME`]. The factories open the device lazily,
+/// on each `make` call, so registration itself never touches the GPU.
 pub fn register_into(registry: &mut RenderRegistry) {
     registry.register(
         BACKEND_NAME,
         Box::new(|| Ok(Box::new(GpuRenderer::new()?) as Box<dyn Renderer>)),
+    );
+    registry.register(
+        PATHTRACE_BACKEND_NAME,
+        Box::new(|| Ok(Box::new(GpuPathTracer::new()?) as Box<dyn Renderer>)),
     );
 }

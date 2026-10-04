@@ -134,3 +134,55 @@ fn fs_resolve(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(linear_to_srgb(out.r), linear_to_srgb(out.g), linear_to_srgb(out.b), out.a);
 }
+
+// ---------------------------------------------------------------------
+// Path-trace resolve (oxideav-render pathtrace §1): one accumulator
+// entry per output pixel — Σ radiance over covered samples (rgb) and
+// the covered-sample count (a). Radiance is averaged *before* tone
+// mapping; the covered fraction `f` mixes the mapped mean with the
+// background in display-linear space:
+// `c = (f·T(m) + (1−f)·b·b_a) / (f + (1−f)·b_a)`, `alpha = f + (1−f)·b_a`,
+// so a fully uncovered pixel keeps the background bytes exactly.
+// `exposure.y` = samples taken, `exposure.z` = output width.
+// ---------------------------------------------------------------------
+
+@group(1) @binding(0) var<storage, read> pt_accum: array<vec4<f32>>;
+
+@fragment
+fn fs_resolve_pt(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let hdr = p.cfg.w == 1u;
+    let bg_lin = vec3<f32>(
+        srgb_to_linear(p.background.r),
+        srgb_to_linear(p.background.g),
+        srgb_to_linear(p.background.b),
+    );
+    let ba = p.background.a;
+    let n = p.exposure.y;
+    let idx = u32(pos.y) * u32(p.exposure.z) + u32(pos.x);
+    let a = pt_accum[idx];
+    var out: vec4<f32>;
+    if (a.w <= 0.0 || n <= 0.0) {
+        out = vec4<f32>(bg_lin, ba);
+    } else {
+        let m = a.rgb / a.w;
+        let f = clamp(a.w / n, 0.0, 1.0);
+        var c = m;
+        if (!hdr) {
+            c = tone_map(m * p.exposure.x);
+        }
+        if (f >= 1.0) {
+            out = vec4<f32>(c, 1.0);
+        } else {
+            let a_sum = f + (1.0 - f) * ba;
+            if (a_sum > 0.0) {
+                out = vec4<f32>((f * c + (1.0 - f) * bg_lin * ba) / a_sum, a_sum);
+            } else {
+                out = vec4<f32>(f * c + (1.0 - f) * bg_lin, 0.0);
+            }
+        }
+    }
+    if (hdr) {
+        return out;
+    }
+    return vec4<f32>(linear_to_srgb(out.r), linear_to_srgb(out.g), linear_to_srgb(out.b), out.a);
+}

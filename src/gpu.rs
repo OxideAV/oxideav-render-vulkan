@@ -129,7 +129,7 @@ pub(crate) struct GpuContext {
     texture_cache: TextureCache,
 }
 
-fn backend_err(what: &str, e: impl std::fmt::Display) -> Error {
+pub(crate) fn backend_err(what: &str, e: impl std::fmt::Display) -> Error {
     Error::Backend(format!("wgpu: {what}: {e}"))
 }
 
@@ -153,41 +153,8 @@ impl GpuContext {
     }
 
     async fn new_async(backend: GpuBackend) -> Result<Self> {
-        let backends = match backend {
-            GpuBackend::Auto => wgpu::Backends::all(),
-            GpuBackend::Vulkan => wgpu::Backends::VULKAN,
-            GpuBackend::Gl => wgpu::Backends::GL,
-            GpuBackend::Metal => wgpu::Backends::METAL,
-            GpuBackend::Dx12 => wgpu::Backends::DX12,
-        };
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            flags: wgpu::InstanceFlags::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            display: None,
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|e| backend_err("no suitable adapter", e))?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("oxideav-render-vulkan"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::default(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .map_err(|e| backend_err("request_device", e))?;
-        Ok(Self::from_device(device, queue, adapter.get_info()))
+        let (device, queue, info) = open_device(backend).await?;
+        Ok(Self::from_device(device, queue, info))
     }
 
     /// Build pipelines on an existing device (e.g. one shared with a
@@ -988,61 +955,125 @@ impl GpuContext {
         self.encode_frame(&mut encoder, &mut gs, opts, hdr)?;
         let (w, h) = (opts.width.max(1), opts.height.max(1));
         let bpp = if hdr { 16 } else { 4 };
-
-        // Readback buffer rows must be 256-byte aligned.
-        let unpadded = w as usize * bpp;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-        let padded = unpadded.div_ceil(align) * align;
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (padded * h as usize) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         let targets = self.targets.as_ref().expect("targets ensured");
         let source = match (&targets.hdr_out, hdr) {
             (Some((tex, _)), true) => tex,
             _ => &targets.output,
         };
-        encoder.copy_texture_to_buffer(
-            source.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded as u32),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| backend_err("poll", e))?;
-        rx.recv()
-            .map_err(|e| backend_err("map_async", e))?
-            .map_err(|e| backend_err("map_async", e))?;
-        let mut pixels = Vec::with_capacity(unpadded * h as usize);
-        {
-            let data = slice.get_mapped_range();
-            for row in data.chunks_exact(padded) {
-                pixels.extend_from_slice(&row[..unpadded]);
-            }
-        }
-        readback.unmap();
-        Ok(pixels)
+        readback_texture(&self.device, &self.queue, encoder, source, w, h, bpp)
     }
+}
+
+/// Open an adapter + device headlessly (no surface): downlevel limits
+/// raised to the adapter's texture size and storage-buffer limits
+/// (the path tracer binds the whole scene as storage buffers).
+pub(crate) async fn open_device(
+    backend: GpuBackend,
+) -> Result<(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo)> {
+    let backends = match backend {
+        GpuBackend::Auto => wgpu::Backends::all(),
+        GpuBackend::Vulkan => wgpu::Backends::VULKAN,
+        GpuBackend::Gl => wgpu::Backends::GL,
+        GpuBackend::Metal => wgpu::Backends::METAL,
+        GpuBackend::Dx12 => wgpu::Backends::DX12,
+    };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        display: None,
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .map_err(|e| backend_err("no suitable adapter", e))?;
+    let al = adapter.limits();
+    let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(al.clone());
+    limits.max_storage_buffer_binding_size = limits
+        .max_storage_buffer_binding_size
+        .max(al.max_storage_buffer_binding_size);
+    limits.max_buffer_size = limits.max_buffer_size.max(al.max_buffer_size);
+    limits.max_storage_buffers_per_shader_stage = limits
+        .max_storage_buffers_per_shader_stage
+        .max(al.max_storage_buffers_per_shader_stage.min(8));
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("oxideav-render-vulkan"),
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
+            memory_hints: wgpu::MemoryHints::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        })
+        .await
+        .map_err(|e| backend_err("request_device", e))?;
+    Ok((device, queue, adapter.get_info()))
+}
+
+/// Copy `source` (`w × h`, `bpp` bytes per texel) to the CPU after the
+/// commands already in `encoder`, submit, and wait.
+pub(crate) fn readback_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mut encoder: wgpu::CommandEncoder,
+    source: &wgpu::Texture,
+    w: u32,
+    h: u32,
+    bpp: usize,
+) -> Result<Vec<u8>> {
+    // Readback buffer rows must be 256-byte aligned.
+    let unpadded = w as usize * bpp;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    let padded = unpadded.div_ceil(align) * align;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: (padded * h as usize) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        source.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded as u32),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| backend_err("poll", e))?;
+    rx.recv()
+        .map_err(|e| backend_err("map_async", e))?
+        .map_err(|e| backend_err("map_async", e))?;
+    let mut pixels = Vec::with_capacity(unpadded * h as usize);
+    {
+        let data = slice.get_mapped_range();
+        for row in data.chunks_exact(padded) {
+            pixels.extend_from_slice(&row[..unpadded]);
+        }
+    }
+    readback.unmap();
+    Ok(pixels)
 }
 
 fn shading_code(mode: ShadingMode) -> u32 {
