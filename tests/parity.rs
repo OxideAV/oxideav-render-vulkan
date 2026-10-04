@@ -133,3 +133,30 @@ fn shadows_darken_the_floor() {
         "enabling shadows must remove light somewhere"
     );
 }
+
+#[test]
+fn hdr_matches_scanline_hdr() {
+    let Ok(mut gpu) = GpuRenderer::new() else {
+        return;
+    };
+    let scene = testscenes::sphere_grid(4, 3);
+    let o = RenderOptions {
+        exposure: 3.0,
+        ..opts()
+    };
+    let g = gpu.render_hdr(&scene, &o).unwrap();
+    let c = make_renderer(RenderBackend::Scanline)
+        .unwrap()
+        .render_hdr(&scene, &o)
+        .unwrap();
+    assert_eq!((g.width, g.height), (c.width, c.height));
+    let mut err = 0.0f64;
+    let mut max = 0.0f32;
+    for (a, b) in g.pixels.iter().zip(&c.pixels) {
+        err += (a - b).abs() as f64;
+        max = max.max(a.abs());
+    }
+    let mae = err / g.pixels.len() as f64;
+    eprintln!("hdr MAE {mae:.5}, max value {max}");
+    assert!(mae < 0.01, "HDR mean abs error {mae}");
+}

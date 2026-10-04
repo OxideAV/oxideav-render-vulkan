@@ -8,8 +8,8 @@
 use bytemuck::{Pod, Zeroable};
 use oxideav_render::prepare::{DrawTopology, LightKind, PrepareOptions, PreparedLight};
 use oxideav_render::{
-    Camera, DepthRange, Error, PreparedScene, RenderOptions, Result, RgbaImage, ShadingMode,
-    TextureCache, ToneMap,
+    Camera, DepthRange, Error, HdrImage, PreparedScene, RenderOptions, Result, RgbaImage,
+    ShadingMode, TextureCache, ToneMap,
 };
 use wgpu::util::DeviceExt;
 
@@ -23,6 +23,8 @@ pub(crate) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8U
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const COVERAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Output format of the HDR resolve (`render_hdr`).
+const HDR_OUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// Legacy-mode ambient term — identical to the scanline backend's.
 const LEGACY_AMBIENT: f32 = 0.2;
 const MAX_LIGHTS: usize = 16;
@@ -93,6 +95,8 @@ struct Targets {
     depth_view: wgpu::TextureView,
     output: wgpu::Texture,
     output_view: wgpu::TextureView,
+    /// Scene-linear `Rgba32Float` output, created on first HDR render.
+    hdr_out: Option<(wgpu::Texture, wgpu::TextureView)>,
 }
 
 struct Pipelines {
@@ -103,6 +107,7 @@ struct Pipelines {
     lines: wgpu::RenderPipeline,
     points: wgpu::RenderPipeline,
     resolve: wgpu::RenderPipeline,
+    resolve_hdr: wgpu::RenderPipeline,
     shadow: wgpu::RenderPipeline,
 }
 
@@ -364,6 +369,7 @@ impl GpuContext {
             depth_view: depth.create_view(&Default::default()),
             output_view: output.create_view(&Default::default()),
             output,
+            hdr_out: None,
         });
     }
 
@@ -384,7 +390,7 @@ impl GpuContext {
         opts: &RenderOptions,
     ) -> Result<&wgpu::Texture> {
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.encode_frame(&mut encoder, gs, opts)?;
+        self.encode_frame(&mut encoder, gs, opts, false)?;
         self.queue.submit([encoder.finish()]);
         Ok(&self.targets.as_ref().expect("targets ensured").output)
     }
@@ -394,6 +400,7 @@ impl GpuContext {
         encoder: &mut wgpu::CommandEncoder,
         gs: &mut GpuScene,
         opts: &RenderOptions,
+        hdr_out: bool,
     ) -> Result<()> {
         let (w, h) = (opts.width.max(1), opts.height.max(1));
         if w > self.max_dim || h > self.max_dim {
@@ -405,6 +412,27 @@ impl GpuContext {
         let aa = self.effective_aa(opts, w, h);
         let (rw, rh) = (w * aa, h * aa);
         self.ensure_targets(rw, rh, w, h);
+        if hdr_out {
+            let t = self.targets.as_mut().expect("targets ensured above");
+            if t.hdr_out.is_none() {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("hdr output"),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: HDR_OUT_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let view = tex.create_view(&Default::default());
+                t.hdr_out = Some((tex, view));
+            }
+        }
 
         let mode = shading_code(opts.shading);
         let pbr = mode == 6;
@@ -701,7 +729,7 @@ impl GpuContext {
             (0, 1.0)
         };
         let params = ResolveParams {
-            cfg: [aa, class, tone, 0],
+            cfg: [aa, class, tone, u32::from(hdr_out)],
             exposure: [exposure, 0.0, 0.0, 0.0],
             background: bg,
         };
@@ -733,7 +761,10 @@ impl GpuContext {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("resolve"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &targets.output_view,
+                view: match (&targets.hdr_out, hdr_out) {
+                    (Some((_, view)), true) => view,
+                    _ => &targets.output_view,
+                },
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -746,7 +777,11 @@ impl GpuContext {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.pipelines.resolve);
+        pass.set_pipeline(if hdr_out {
+            &self.pipelines.resolve_hdr
+        } else {
+            &self.pipelines.resolve
+        });
         pass.set_bind_group(0, &resolve_bg, &[]);
         pass.draw(0..3, 0..1);
         Ok(())
@@ -913,13 +948,49 @@ impl GpuContext {
         scene: &oxideav_mesh3d::Scene3D,
         opts: &RenderOptions,
     ) -> Result<RgbaImage> {
+        let (w, h) = (opts.width.max(1), opts.height.max(1));
+        let pixels = self.render_readback(scene, opts, false)?;
+        Ok(RgbaImage {
+            width: w,
+            height: h,
+            pixels,
+            stride: w as usize * 4,
+        })
+    }
+
+    /// Scene-linear render (no exposure / tone map / encode), resolved
+    /// like the scanline backend's `render_hdr`.
+    pub(crate) fn render_hdr(
+        &mut self,
+        scene: &oxideav_mesh3d::Scene3D,
+        opts: &RenderOptions,
+    ) -> Result<HdrImage> {
+        let (w, h) = (opts.width.max(1), opts.height.max(1));
+        let bytes = self.render_readback(scene, opts, true)?;
+        Ok(HdrImage {
+            width: w,
+            height: h,
+            pixels: bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        })
+    }
+
+    fn render_readback(
+        &mut self,
+        scene: &oxideav_mesh3d::Scene3D,
+        opts: &RenderOptions,
+        hdr: bool,
+    ) -> Result<Vec<u8>> {
         let mut gs = self.upload(scene, opts);
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.encode_frame(&mut encoder, &mut gs, opts)?;
+        self.encode_frame(&mut encoder, &mut gs, opts, hdr)?;
         let (w, h) = (opts.width.max(1), opts.height.max(1));
+        let bpp = if hdr { 16 } else { 4 };
 
         // Readback buffer rows must be 256-byte aligned.
-        let unpadded = w as usize * 4;
+        let unpadded = w as usize * bpp;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
         let padded = unpadded.div_ceil(align) * align;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -929,8 +1000,12 @@ impl GpuContext {
             mapped_at_creation: false,
         });
         let targets = self.targets.as_ref().expect("targets ensured");
+        let source = match (&targets.hdr_out, hdr) {
+            (Some((tex, _)), true) => tex,
+            _ => &targets.output,
+        };
         encoder.copy_texture_to_buffer(
-            targets.output.as_image_copy(),
+            source.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -966,12 +1041,7 @@ impl GpuContext {
             }
         }
         readback.unmap();
-        Ok(RgbaImage {
-            width: w,
-            height: h,
-            pixels,
-            stride: unpadded,
-        })
+        Ok(pixels)
     }
 }
 
@@ -1087,31 +1157,35 @@ fn build_pipelines(
         bind_group_layouts: &[Some(resolve)],
         immediate_size: 0,
     });
-    let resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("resolve"),
-        layout: Some(&resolve_layout),
-        vertex: wgpu::VertexState {
-            module: &resolve_shader,
-            entry_point: Some("vs_fullscreen"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &resolve_shader,
-            entry_point: Some("fs_resolve"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: COLOR_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    });
+    let resolve_for = |format: wgpu::TextureFormat| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("resolve"),
+            layout: Some(&resolve_layout),
+            vertex: wgpu::VertexState {
+                module: &resolve_shader,
+                entry_point: Some("vs_fullscreen"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &resolve_shader,
+                entry_point: Some("fs_resolve"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let resolve = resolve_for(COLOR_FORMAT);
+    let resolve_hdr = resolve_for(HDR_OUT_FORMAT);
     Pipelines {
         opaque: [
             make("opaque", tri, None, None, "fs_main"),
@@ -1136,6 +1210,7 @@ fn build_pipelines(
             "fs_unlit",
         ),
         resolve,
+        resolve_hdr,
         shadow: shadow_pipeline(device, &scene_shader, [empty, material, shadow_pass]),
     }
 }

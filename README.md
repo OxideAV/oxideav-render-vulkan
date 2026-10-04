@@ -31,7 +31,7 @@ oxideplay's 3D viewer does.
 | Supersampled AA (`aa` 1..=8, shrunk to fit the device's texture limit) | done |
 | Upload once / draw many (`upload` + `draw` → GPU texture, no readback) for interactive viewers; shared device via `from_device` | done |
 | Shadow maps for directional / spot lights (`opts.shadows`), mirroring the scanline maps: linear light depth, same light-space fit, normal offset, 3×3 bilinear PCF, MASK casters | done |
-| Native `render_hdr` (float readback) | planned |
+| Native `render_hdr`: scene-linear `Rgba32Float` resolve + readback (matches the scanline float path, MAE < 1e-4) | done |
 | Hardware ray tracing / GPU path tracer (ray queries) | planned |
 
 ## Usage

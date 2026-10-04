@@ -37,6 +37,10 @@ All notable changes to this project will be documented in this file.
   3×3 bilinear PCF as the scanline backend, MASK casters honour their
   cutoff, BLEND surfaces cast nothing.
 - GPU-vs-scanline `Pbr` parity suite over the shared test scenes.
+- Native `Renderer::render_hdr`: scene-linear float resolve on the GPU,
+  same averaging contract as the scanline backend.
+- Resolve averages fall back to the straight mean when every sample is
+  fully transparent (scanline parity).
 
 ### Changed
 

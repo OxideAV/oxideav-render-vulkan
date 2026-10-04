@@ -51,7 +51,9 @@ mod gpu;
 mod scene;
 mod shadow;
 
-use oxideav_render::{RenderOptions, RenderRegistry, Renderer, Result, RgbaImage, TextureResolver};
+use oxideav_render::{
+    HdrImage, RenderOptions, RenderRegistry, Renderer, Result, RgbaImage, TextureResolver,
+};
 
 pub use oxideav_render::Error;
 
@@ -190,6 +192,18 @@ impl Renderer for GpuRenderer {
         opts: &RenderOptions,
     ) -> Result<RgbaImage> {
         self.ctx.render(scene, opts)
+    }
+
+    /// Native float path: scene-linear radiance resolved on the GPU
+    /// (no exposure, tone map or encode), uncovered pixels holding the
+    /// linearised background — the same contract as the scanline
+    /// backend's `render_hdr`.
+    fn render_hdr(
+        &mut self,
+        scene: &oxideav_mesh3d::Scene3D,
+        opts: &RenderOptions,
+    ) -> Result<HdrImage> {
+        self.ctx.render_hdr(scene, opts)
     }
 }
 
