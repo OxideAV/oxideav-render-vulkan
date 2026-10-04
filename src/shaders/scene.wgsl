@@ -21,6 +21,7 @@
 // attenuation per KHR_lights_punctual.
 
 const MAX_LIGHTS: u32 = 16u;
+const MAX_SHADOWS: u32 = 4u;
 const PI: f32 = 3.141592653589793;
 
 struct Light {
@@ -30,8 +31,18 @@ struct Light {
     direction: vec4<f32>,
     // rgb = colour * intensity
     radiance: vec4<f32>,
-    // x = cos(inner cone), y = cos(outer cone)
+    // x = cos(inner cone), y = cos(outer cone), z = shadow layer (< 0: none)
     cone: vec4<f32>,
+};
+
+// Shadow map of one light: linear depth along `dir` from `eye` per
+// texel (+inf = nothing), mirroring oxideav-render's scanline maps.
+struct ShadowInfo {
+    view_proj: mat4x4<f32>,
+    // xyz = light eye, w = world texel size (perspective: per unit distance)
+    eye_texel: vec4<f32>,
+    // xyz = light direction, w = 1 for a perspective (spot) map
+    dir_persp: vec4<f32>,
 };
 
 struct Globals {
@@ -45,6 +56,14 @@ struct Globals {
     // x = shading mode, y = light count
     mode: vec4<u32>,
     lights: array<Light, MAX_LIGHTS>,
+    shadows: array<ShadowInfo, MAX_SHADOWS>,
+};
+
+// Shadow-map pass parameters (one dynamic-offset slot per light).
+struct ShadowPass {
+    view_proj: mat4x4<f32>,
+    eye: vec4<f32>,
+    dir: vec4<f32>,
 };
 
 struct Material {
@@ -66,6 +85,8 @@ struct Material {
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
+@group(0) @binding(1) var t_shadow: texture_2d_array<f32>;
+@group(2) @binding(0) var<uniform> sp: ShadowPass;
 @group(1) @binding(0) var<uniform> m: Material;
 @group(1) @binding(1) var t_base: texture_2d<f32>;
 @group(1) @binding(2) var s_base: sampler;
@@ -195,7 +216,68 @@ fn light_sample(i: u32, p: vec3<f32>, l_out: ptr<function, vec3<f32>>) -> vec3<f
     return light.radiance.rgb * att;
 }
 
+// Fraction of light `i` reaching `p` (geometric normal `ng`, unit
+// direction to the light `l`): normal-offset 3×3 bilinear PCF over
+// linear light depths (Williams 1978; Reeves et al. 1987).
+fn shadow_visibility(layer: u32, p: vec3<f32>, ng_in: vec3<f32>, l: vec3<f32>) -> f32 {
+    let sh = g.shadows[layer];
+    let eye = sh.eye_texel.xyz;
+    let dir = sh.dir_persp.xyz;
+    var texel = sh.eye_texel.w;
+    if (sh.dir_persp.w > 0.5) {
+        texel *= max(dot(p - eye, dir), 1e-4);
+    }
+    var ng = ng_in;
+    if (dot(ng, l) < 0.0) {
+        ng = -ng;
+    }
+    let cos_t = clamp(dot(ng, l), 0.0, 1.0);
+    let q = p + ng * (texel * (1.0 + 2.0 * (1.0 - cos_t)));
+    let c = sh.view_proj * vec4<f32>(q, 1.0);
+    if (c.w <= 0.0) {
+        return 1.0;
+    }
+    let size = i32(textureDimensions(t_shadow).x);
+    let s = f32(size);
+    let u = (c.x / c.w * 0.5 + 0.5) * s - 0.5;
+    let v = (1.0 - (c.y / c.w * 0.5 + 0.5)) * s - 0.5;
+    if (!(u > -1.0 && v > -1.0 && u < s && v < s)) {
+        return 1.0;
+    }
+    let d_recv = dot(q - eye, dir) - texel;
+    var sum = 0.0;
+    for (var oy = -1; oy <= 1; oy++) {
+        for (var ox = -1; ox <= 1; ox++) {
+            let fu = u + f32(ox);
+            let fv = v + f32(oy);
+            let x0 = i32(floor(fu));
+            let y0 = i32(floor(fv));
+            let tx = fu - floor(fu);
+            let ty = fv - floor(fv);
+            let a = shadow_lit(x0, y0, size, layer, d_recv) * (1.0 - tx)
+                + shadow_lit(x0 + 1, y0, size, layer, d_recv) * tx;
+            let b = shadow_lit(x0, y0 + 1, size, layer, d_recv) * (1.0 - tx)
+                + shadow_lit(x0 + 1, y0 + 1, size, layer, d_recv) * tx;
+            sum += a * (1.0 - ty) + b * ty;
+        }
+    }
+    return sum / 9.0;
+}
+
+fn shadow_lit(x: i32, y: i32, size: i32, layer: u32, d_recv: f32) -> f32 {
+    if (x < 0 || y < 0 || x >= size || y >= size) {
+        return 1.0;
+    }
+    if (textureLoad(t_shadow, vec2<i32>(x, y), i32(layer), 0).r >= d_recv) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
 fn shade_pbr(in: VsOut, front: bool) -> vec4<f32> {
+    // Geometric normal from screen-space derivatives (sign is resolved
+    // towards each light in `shadow_visibility`).
+    let ng = safe_normalize(cross(dpdx(in.world), dpdy(in.world)));
     // Sample every slot up front, in uniform control flow (implicit-
     // derivative sampling must not sit behind per-fragment branches).
     // Absent slots are bound to a 1×1 white texture and ignored.
@@ -272,7 +354,12 @@ fn shade_pbr(in: VsOut, front: bool) -> vec4<f32> {
         let f = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - v_dot_h, 5.0);
         let spec = f * d_ggx(n_dot_h, a2) * v_smith_correlated(n_dot_l, n_dot_v, a2);
         let diffuse = (vec3<f32>(1.0) - f) * c_diff / PI;
-        colour += (diffuse + spec) * radiance * n_dot_l;
+        var vis = 1.0;
+        let layer = g.lights[i].cone.z;
+        if (layer >= 0.0) {
+            vis = shadow_visibility(u32(layer), in.world, ng, l);
+        }
+        colour += (diffuse + spec) * radiance * n_dot_l * vis;
     }
     return vec4<f32>(colour * alpha, alpha);
 }
@@ -324,4 +411,49 @@ fn fs_unlit(in: VsOut) -> FsOut {
         out.color = m.base_color;
     }
     return out;
+}
+
+// ---- Shadow-map pass ------------------------------------------------
+
+struct ShadowVsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) uv0: vec2<f32>,
+    @location(2) uv1: vec2<f32>,
+    @location(3) color: vec4<f32>,
+};
+
+@vertex
+fn vs_shadow(in: VsIn) -> ShadowVsOut {
+    var out: ShadowVsOut;
+    out.clip = sp.view_proj * vec4<f32>(in.position, 1.0);
+    out.world = in.position;
+    out.uv0 = in.uv0;
+    out.uv1 = in.uv1;
+    out.color = in.color;
+    return out;
+}
+
+// Writes the linear light depth; MASK casters honour their cutoff.
+@fragment
+fn fs_shadow(in: ShadowVsOut) -> @location(0) vec4<f32> {
+    var uv = in.uv0;
+    if ((m.flags.w & 1u) != 0u) {
+        uv = in.uv1;
+    }
+    let r0 = m.uv_xform[0];
+    let r1 = m.uv_xform[1];
+    let tuv = vec2<f32>(dot(r0.xyz, vec3<f32>(uv, 1.0)), dot(r1.xyz, vec3<f32>(uv, 1.0)));
+    let tex = textureSample(t_base, s_base, tuv);
+    if (m.flags.y == 1u) {
+        var a = m.base_color.a * in.color.a;
+        if ((m.flags.x & 1u) != 0u) {
+            a *= tex.a;
+        }
+        if (a < m.emissive.w) {
+            discard;
+        }
+    }
+    let d = dot(in.world - sp.eye.xyz, sp.dir.xyz);
+    return vec4<f32>(d, 0.0, 0.0, 1.0);
 }

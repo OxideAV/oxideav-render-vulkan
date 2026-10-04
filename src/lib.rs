@@ -49,6 +49,7 @@
 
 mod gpu;
 mod scene;
+mod shadow;
 
 use oxideav_render::{RenderOptions, RenderRegistry, Renderer, Result, RgbaImage, TextureResolver};
 

@@ -26,6 +26,35 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Legacy-mode ambient term — identical to the scanline backend's.
 const LEGACY_AMBIENT: f32 = 0.2;
 const MAX_LIGHTS: usize = 16;
+const MAX_SHADOWS: usize = 4;
+const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+/// Dynamic-offset stride of the per-light shadow-pass uniform.
+const SHADOW_SLOT: u64 = 256;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, Pod, Zeroable)]
+struct ShadowUniform {
+    view_proj: [[f32; 4]; 4],
+    eye_texel: [f32; 4],
+    dir_persp: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct ShadowPassUniform {
+    view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],
+    dir: [f32; 4],
+}
+
+/// Shadow-map array (one `R32Float` linear-depth layer per shadowed
+/// light) plus its depth buffer, cached per (size, layers).
+struct ShadowTargets {
+    key: (u32, u32),
+    array_view: wgpu::TextureView,
+    layer_views: Vec<wgpu::TextureView>,
+    depth_view: wgpu::TextureView,
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, Pod, Zeroable)]
@@ -45,6 +74,7 @@ struct Globals {
     params: [f32; 4],
     mode: [u32; 4],
     lights: [LightUniform; MAX_LIGHTS],
+    shadows: [ShadowUniform; MAX_SHADOWS],
 }
 
 #[repr(C)]
@@ -73,6 +103,7 @@ struct Pipelines {
     lines: wgpu::RenderPipeline,
     points: wgpu::RenderPipeline,
     resolve: wgpu::RenderPipeline,
+    shadow: wgpu::RenderPipeline,
 }
 
 /// A live GPU device with the scene pipelines compiled.
@@ -84,9 +115,12 @@ pub(crate) struct GpuContext {
     globals_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
     resolve_layout: wgpu::BindGroupLayout,
+    shadow_pass_layout: wgpu::BindGroupLayout,
+    empty_group: wgpu::BindGroup,
     pipelines: Pipelines,
     cache: ResourceCache,
     targets: Option<Targets>,
+    shadow_targets: Option<ShadowTargets>,
     texture_cache: TextureCache,
 }
 
@@ -161,9 +195,48 @@ impl GpuContext {
         let max_dim = device.limits().max_texture_dimension_2d;
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT)],
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
         });
         let material_layout = material_layout(&device);
+        let shadow_pass_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow pass"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<ShadowPassUniform>() as u64,
+                        ),
+                    },
+                    count: None,
+                }],
+            });
+        // The shadow pass renders into the array `@group(0)` samples,
+        // so it binds an empty group 0 instead of the globals.
+        let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("empty"),
+            entries: &[],
+        });
+        let empty_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("empty"),
+            layout: &empty_layout,
+            entries: &[],
+        });
         let scene_texture = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -182,8 +255,11 @@ impl GpuContext {
                 scene_texture(2),
             ],
         });
-        let pipelines =
-            build_pipelines(&device, &globals_layout, &material_layout, &resolve_layout);
+        let pipelines = build_pipelines(
+            &device,
+            [&globals_layout, &material_layout, &resolve_layout],
+            [&empty_layout, &shadow_pass_layout],
+        );
         let cache = ResourceCache::new(&device, &queue);
         Self {
             device,
@@ -193,9 +269,12 @@ impl GpuContext {
             globals_layout,
             material_layout,
             resolve_layout,
+            shadow_pass_layout,
+            empty_group,
             pipelines,
             cache,
             targets: None,
+            shadow_targets: None,
             texture_cache: TextureCache::default(),
         }
     }
@@ -361,9 +440,53 @@ impl GpuContext {
                     l.color[2] * l.intensity,
                     0.0,
                 ],
-                cone: [l.inner_cone_angle.cos(), l.outer_cone_angle.cos(), 0.0, 0.0],
+                cone: [
+                    l.inner_cone_angle.cos(),
+                    l.outer_cone_angle.cos(),
+                    -1.0,
+                    0.0,
+                ],
             };
         }
+        // Shadow maps (Pbr + `opts.shadows`): directional / spot lights,
+        // first MAX_SHADOWS of them.
+        let mut shadow_uniforms = [ShadowUniform::default(); MAX_SHADOWS];
+        let mut shadow_setups = Vec::new();
+        let shadow_size = opts.shadow_map_size.clamp(16, 8192).min(self.max_dim);
+        if pbr && opts.shadows {
+            if let Some(bounds) = gs.prepared.bounds() {
+                for (li, l) in lights.iter().enumerate().take(MAX_LIGHTS) {
+                    if shadow_setups.len() == MAX_SHADOWS {
+                        break;
+                    }
+                    if let Some(sh) = crate::shadow::setup(l, bounds, shadow_size) {
+                        let layer = shadow_setups.len();
+                        light_uniforms[li].cone[2] = layer as f32;
+                        shadow_uniforms[layer] = ShadowUniform {
+                            view_proj: crate::shadow::column_major(&sh.view_proj),
+                            eye_texel: [sh.eye[0], sh.eye[1], sh.eye[2], sh.texel],
+                            dir_persp: [
+                                sh.dir[0],
+                                sh.dir[1],
+                                sh.dir[2],
+                                sh.perspective as u32 as f32,
+                            ],
+                        };
+                        shadow_setups.push(sh);
+                    }
+                }
+            }
+        }
+        let shadow_key = if shadow_setups.is_empty() {
+            (1, 1)
+        } else {
+            (shadow_size, shadow_setups.len() as u32)
+        };
+        self.ensure_shadow_targets(shadow_key);
+        if !shadow_setups.is_empty() {
+            self.encode_shadow_maps(encoder, gs, &shadow_setups);
+        }
+
         let legacy = {
             let az = opts.light.azimuth_deg.to_radians();
             let el = opts.light.elevation_deg.to_radians();
@@ -384,6 +507,7 @@ impl GpuContext {
             params: [LEGACY_AMBIENT, opts.ambient.max(0.0), 0.0, 0.0],
             mode: [mode, lights.len().min(MAX_LIGHTS) as u32, 0, 0],
             lights: light_uniforms,
+            shadows: shadow_uniforms,
         };
         let globals_buf = self
             .device
@@ -395,10 +519,18 @@ impl GpuContext {
         let globals_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
             layout: &self.globals_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: globals_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.shadow_targets.as_ref().expect("ensured").array_view,
+                    ),
+                },
+            ],
         });
 
         // Wireframe edges (legacy) and sorted BLEND triangles (Pbr).
@@ -620,6 +752,148 @@ impl GpuContext {
         Ok(())
     }
 
+    fn ensure_shadow_targets(&mut self, key: (u32, u32)) {
+        if self.shadow_targets.as_ref().is_some_and(|t| t.key == key) {
+            return;
+        }
+        let (size, layers) = key;
+        let color = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow maps"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: layers,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SHADOW_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow depth"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let layer_views = (0..layers)
+            .map(|l| {
+                color.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: l,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        self.shadow_targets = Some(ShadowTargets {
+            key,
+            array_view: color.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            }),
+            layer_views,
+            depth_view: depth.create_view(&Default::default()),
+        });
+    }
+
+    /// Render one linear-depth map per shadowed light. Casters: OPAQUE
+    /// and MASK triangles (BLEND surfaces cast no shadow), both faces.
+    fn encode_shadow_maps(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        gs: &GpuScene,
+        setups: &[crate::shadow::ShadowSetup],
+    ) {
+        let Some(vbuf) = &gs.vertices else { return };
+        let mut bytes = vec![0u8; SHADOW_SLOT as usize * setups.len()];
+        for (k, sh) in setups.iter().enumerate() {
+            let u = ShadowPassUniform {
+                view_proj: crate::shadow::column_major(&sh.view_proj),
+                eye: [sh.eye[0], sh.eye[1], sh.eye[2], 1.0],
+                dir: [sh.dir[0], sh.dir[1], sh.dir[2], 0.0],
+            };
+            let at = k * SHADOW_SLOT as usize;
+            bytes[at..at + std::mem::size_of::<ShadowPassUniform>()]
+                .copy_from_slice(bytemuck::bytes_of(&u));
+        }
+        let buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("shadow pass"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow pass"),
+            layout: &self.shadow_pass_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buf,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(std::mem::size_of::<ShadowPassUniform>() as u64),
+                }),
+            }],
+        });
+        let targets = self.shadow_targets.as_ref().expect("ensured");
+        for k in 0..setups.len() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow map"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.layer_views[k],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f32::MAX as f64,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &targets.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipelines.shadow);
+            pass.set_bind_group(0, &self.empty_group, &[]);
+            pass.set_bind_group(2, &group, &[(k as u64 * SHADOW_SLOT) as u32]);
+            pass.set_vertex_buffer(0, vbuf.slice(..));
+            for it in gs
+                .items
+                .iter()
+                .filter(|i| i.topology == DrawTopology::Triangles)
+            {
+                let m = &gs.materials[it.material];
+                if m.pass == Pass::Blend {
+                    continue;
+                }
+                pass.set_bind_group(1, &m.bind_group, &[]);
+                pass.draw(it.first..it.first + it.count, 0..1);
+            }
+        }
+    }
+
     fn index_buffer(&self, idx: &[u32], label: &str) -> Option<(wgpu::Buffer, u32)> {
         (!idx.is_empty()).then(|| {
             let buf = self
@@ -725,9 +999,8 @@ fn tone_map_code(t: ToneMap) -> u32 {
 
 fn build_pipelines(
     device: &wgpu::Device,
-    globals: &wgpu::BindGroupLayout,
-    material: &wgpu::BindGroupLayout,
-    resolve: &wgpu::BindGroupLayout,
+    [globals, material, resolve]: [&wgpu::BindGroupLayout; 3],
+    [empty, shadow_pass]: [&wgpu::BindGroupLayout; 2],
 ) -> Pipelines {
     let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("scene.wgsl"),
@@ -863,5 +1136,56 @@ fn build_pipelines(
             "fs_unlit",
         ),
         resolve,
+        shadow: shadow_pipeline(device, &scene_shader, [empty, material, shadow_pass]),
     }
+}
+
+fn shadow_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    groups: [&wgpu::BindGroupLayout; 3],
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("shadow"),
+        bind_group_layouts: &groups.map(Some),
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("shadow"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_shadow"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Vertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_shadow"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: SHADOW_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }

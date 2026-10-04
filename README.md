@@ -30,7 +30,7 @@ oxideplay's 3D viewer does.
 | Scene-linear `Rgba16Float` pass, GPU resolve (background composite, supersample average, sRGB encode) | done |
 | Supersampled AA (`aa` 1..=8, shrunk to fit the device's texture limit) | done |
 | Upload once / draw many (`upload` + `draw` → GPU texture, no readback) for interactive viewers; shared device via `from_device` | done |
-| Shadow maps | planned |
+| Shadow maps for directional / spot lights (`opts.shadows`), mirroring the scanline maps: linear light depth, same light-space fit, normal offset, 3×3 bilinear PCF, MASK casters | done |
 | Native `render_hdr` (float readback) | planned |
 | Hardware ray tracing / GPU path tracer (ray queries) | planned |
 
@@ -65,7 +65,12 @@ metallic × roughness sphere grid (`gpu_pbr.ppm`).
 The integration tests compare GPU output against the scanline backend
 (coverage, exact flat colour, mean channel error for Phong) and check
 the `Pbr` path: exposure, unlit, MASK discard, BLEND compositing over
-opaque geometry, and nearest-filtered texture sampling. Each
+opaque geometry, and nearest-filtered texture sampling. `tests/parity.rs`
+renders `oxideav-render`'s shared test scenes (Cornell box, sphere grid,
+checker floor, textured quad, alpha planes, shadow box, skinned/morphed
+beam, normal-mapped quad) with both backends in `Pbr` and requires PSNR
+between 32 and 60 dB depending on the scene. Two scenes are bit-identical.
+Set `OXIDEAV_PARITY_DUMP=<dir>` to write the frame pairs as PPM. Each
 test **skips** when no adapter is available, so GPU-less CI stays green.
 
 ## License

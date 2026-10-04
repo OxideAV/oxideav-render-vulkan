@@ -32,6 +32,11 @@ All notable changes to this project will be documented in this file.
   GPU resolve pass (background composite, supersample average, sRGB
   encode); `draw` now honours `aa`.
 - `set_texture_resolver`.
+- Shadow maps (`opts.shadows`) for up to 4 directional / spot lights:
+  `R32Float` linear-depth array, same light-space fit and normal-offset
+  3×3 bilinear PCF as the scanline backend, MASK casters honour their
+  cutoff, BLEND surfaces cast nothing.
+- GPU-vs-scanline `Pbr` parity suite over the shared test scenes.
 
 ### Changed
 
