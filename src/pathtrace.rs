@@ -39,10 +39,24 @@
 //! # Kernel
 //!
 //! A megakernel: one invocation traces whole paths for one pixel (8×8
-//! workgroups), several consecutive samples per dispatch, with a
-//! per-thread BVH stack (ordered near-first traversal, Aila & Laine
-//! 2009). Large frames are dispatched in row tiles with a bounded
-//! number of paths per dispatch to stay clear of driver watchdogs.
+//! workgroups), several consecutive samples per dispatch. Each path is
+//! a small per-thread state machine — every loop iteration traces
+//! exactly one ray, either the path's continuation ray or one of the
+//! vertex's NEE shadow rays (punctual lights in order, then the area /
+//! environment sample) — so the kernel has a single BVH traversal, a
+//! single material evaluation and two BSDF evaluations. That keeps the
+//! driver's fully-inlined shader small (pipeline creation ~1.5 s cold
+//! instead of ~16 s for the naive structure). Traversal is a per-thread
+//! stack walk, ordered near-first with entry-distance culling on pop
+//! (Aila & Laine 2009), shared by closest-hit and any-hit queries.
+//! Large frames are dispatched in row tiles with a bounded number of
+//! paths per dispatch to stay clear of driver watchdogs.
+//!
+//! Sample `s` of every pixel uses the CPU tracer's random numbers, and
+//! contributions are added in the CPU's order, so images agree with
+//! [`oxideav_render::PathTracer`] to float rounding (the tests measure
+//! 63–85 dB PSNR at 64 spp); only paths whose rounding flips a
+//! discrete choice diverge, which is statistically neutral.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -433,6 +447,13 @@ impl GpuPathTracer {
     /// The wgpu device the tracer runs on.
     pub fn device(&self) -> &wgpu::Device {
         &self.device
+    }
+
+    /// Human-readable adapter description: `"<name> (<device type>,
+    /// <api>)"`.
+    pub fn adapter_summary(&self) -> String {
+        let i = &self.info;
+        format!("{} ({:?}, {:?})", i.name, i.device_type, i.backend)
     }
 
     /// The wgpu queue the tracer submits to.

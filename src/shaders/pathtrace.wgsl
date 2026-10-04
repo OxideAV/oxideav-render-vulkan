@@ -376,11 +376,11 @@ fn filter_level(lv: Level, uv: vec2<f32>, linear: bool, ws: u32, wt: u32) -> vec
     let fy = yf - y0f;
     let x0 = i32(x0f);
     let y0 = i32(y0f);
-    let a = fetch(lv, x0, y0, ws, wt);
-    let b = fetch(lv, x0 + 1, y0, ws, wt);
-    let c = fetch(lv, x0, y0 + 1, ws, wt);
-    let d = fetch(lv, x0 + 1, y0 + 1, ws, wt);
-    return mix(mix(a, b, fx), mix(c, d, fx), fy);
+    var taps: array<vec4<f32>, 4>;
+    for (var t = 0; t < 4; t++) {
+        taps[t] = fetch(lv, x0 + (t & 1), y0 + (t >> 1), ws, wt);
+    }
+    return mix(mix(taps[0], taps[1], fx), mix(taps[2], taps[3], fx), fy);
 }
 
 // `PreparedTexture::sample_lod`.
@@ -389,32 +389,43 @@ fn sample_lod(desc: u32, uv: vec2<f32>, lod: f32) -> vec4<f32> {
     let flags = tables[desc + 1u];
     let ws = flags & 3u;
     let wt = (flags >> 2u) & 3u;
-    if (!finite(lod) || lod <= 0.0) {
-        let lin = (flags & 16u) != 0u;
-        return filter_level(tex_level(desc, 0u), uv, lin, ws, wt);
-    }
     let minf = (flags >> 5u) & 7u;
     // 0 Nearest, 1 Linear, 2 NearestMipNearest, 3 LinearMipNearest,
     // 4 NearestMipLinear, 5 LinearMipLinear.
-    let lin = minf == 1u || minf == 3u || minf == 5u;
+    var lin = minf == 1u || minf == 3u || minf == 5u;
     let max_level = f32(levels - 1u);
-    if (minf <= 1u) {
-        return filter_level(tex_level(desc, 0u), uv, lin, ws, wt);
+    // Up to two levels blended by `f`.
+    var l0 = 0u;
+    var l1 = 0u;
+    var f = 0.0;
+    if (!finite(lod) || lod <= 0.0) {
+        lin = (flags & 16u) != 0u;
+    } else if (minf <= 1u) {
+        l0 = 0u;
+    } else if (minf <= 3u) {
+        l0 = u32(clamp(floor(lod + 0.5), 0.0, max_level));
+    } else {
+        let l = clamp(lod, 0.0, max_level);
+        l0 = u32(floor(l));
+        l1 = min(l0 + 1u, levels - 1u);
+        f = l - f32(l0);
     }
-    if (minf <= 3u) {
-        let l = u32(clamp(floor(lod + 0.5), 0.0, max_level));
-        return filter_level(tex_level(desc, l), uv, lin, ws, wt);
+    var n = 1u;
+    if (f > 0.0 && l0 != l1) {
+        n = 2u;
     }
-    let l = clamp(lod, 0.0, max_level);
-    let l0 = u32(floor(l));
-    let l1 = min(l0 + 1u, levels - 1u);
-    let f = l - f32(l0);
-    let a = filter_level(tex_level(desc, l0), uv, lin, ws, wt);
-    if (f <= 0.0 || l0 == l1) {
-        return a;
+    var r: array<vec4<f32>, 2>;
+    for (var i = 0u; i < n; i++) {
+        var level = l0;
+        if (i == 1u) {
+            level = l1;
+        }
+        r[i] = filter_level(tex_level(desc, level), uv, lin, ws, wt);
     }
-    let b = filter_level(tex_level(desc, l1), uv, lin, ws, wt);
-    return mix(a, b, f);
+    if (n == 1u) {
+        return r[0];
+    }
+    return mix(r[0], r[1], f);
 }
 
 // A material texture slot: descriptor, uv uvset, KHR_texture_transform.
@@ -632,8 +643,12 @@ fn node_hi(i: u32) -> vec4<f32> {
     return geom[2u * i + 1u];
 }
 
-// Closest accepted hit along `r` within [0, t_max].
-fn closest_hit(r: Ray, t_max_in: f32, s: Sampler, ray_id: u32, primary: bool) -> Hit {
+// Ordered BVH walk (Aila & Laine 2009 shape, near child first, far
+// child pushed with its entry distance). `any`: stop at the first
+// accepted hit (shadow rays); otherwise return the closest accepted
+// one. Candidates on global triangle `skip` are ignored. `slot ==
+// NONE` = nothing hit.
+fn traverse(r: Ray, t_max_in: f32, s: Sampler, ray_id: u32, primary: bool, any: bool, skip: u32) -> Hit {
     var best: Hit;
     best.slot = NONE;
     if (P.env.w == 0u || !r.valid) {
@@ -654,34 +669,40 @@ fn closest_hit(r: Ray, t_max_in: f32, s: Sampler, ray_id: u32, primary: bool) ->
         let first = bitcast<u32>(lo.w);
         var descended = false;
         if (count > 0u) {
+            var done = false;
             for (var slot = first; slot < first + count; slot++) {
                 let h = intersect(r, slot, t_max);
-                if (h.slot != NONE && accept(h, s, ray_id, primary)) {
-                    t_max = h.t;
+                if (h.slot != NONE && tri_global(slot) != skip && accept(h, s, ray_id, primary)) {
                     best = h;
+                    if (any) {
+                        done = true;
+                        break;
+                    }
+                    t_max = h.t;
                 }
+            }
+            if (done) {
+                break;
             }
         } else {
             let l = first;
             let tl = slab(r, node_lo(l).xyz, node_hi(l).xyz, t_max);
             let tr = slab(r, node_lo(l + 1u).xyz, node_hi(l + 1u).xyz, t_max);
             if (tl >= 0.0 && tr >= 0.0) {
-                if (sp < 64u) {
-                    if (tl <= tr) {
-                        stack[sp] = l + 1u;
-                        stack_t[sp] = tr;
-                        idx = l;
-                    } else {
-                        stack[sp] = l;
-                        stack_t[sp] = tl;
-                        idx = l + 1u;
-                    }
-                    sp += 1u;
-                } else if (tl <= tr) {
-                    idx = l;
-                } else {
-                    idx = l + 1u;
+                var near = l;
+                var far = l + 1u;
+                var t_far = tr;
+                if (tl > tr) {
+                    near = l + 1u;
+                    far = l;
+                    t_far = tl;
                 }
+                if (sp < 64u) {
+                    stack[sp] = far;
+                    stack_t[sp] = t_far;
+                    sp += 1u;
+                }
+                idx = near;
                 descended = true;
             } else if (tl >= 0.0) {
                 idx = l;
@@ -711,71 +732,6 @@ fn closest_hit(r: Ray, t_max_in: f32, s: Sampler, ray_id: u32, primary: bool) ->
         }
     }
     return best;
-}
-
-// `true` when an accepted triangle (other than global `skip`) blocks
-// `r` within [0, t_max].
-fn occluded(r: Ray, t_max: f32, s: Sampler, ray_id: u32, skip: u32) -> bool {
-    if (P.env.w == 0u || !r.valid) {
-        return false;
-    }
-    if (slab(r, node_lo(0u).xyz, node_hi(0u).xyz, t_max) < 0.0) {
-        return false;
-    }
-    var stack: array<u32, 64>;
-    var sp = 0u;
-    var idx = 0u;
-    loop {
-        let lo = node_lo(idx);
-        let hi = node_hi(idx);
-        let count = bitcast<u32>(hi.w);
-        let first = bitcast<u32>(lo.w);
-        var descended = false;
-        if (count > 0u) {
-            for (var slot = first; slot < first + count; slot++) {
-                let h = intersect(r, slot, t_max);
-                if (h.slot != NONE && tri_global(slot) != skip && accept(h, s, ray_id, false)) {
-                    return true;
-                }
-            }
-        } else {
-            let l = first;
-            let tl = slab(r, node_lo(l).xyz, node_hi(l).xyz, t_max);
-            let tr = slab(r, node_lo(l + 1u).xyz, node_hi(l + 1u).xyz, t_max);
-            if (tl >= 0.0 && tr >= 0.0) {
-                if (sp < 64u) {
-                    if (tl <= tr) {
-                        stack[sp] = l + 1u;
-                        idx = l;
-                    } else {
-                        stack[sp] = l;
-                        idx = l + 1u;
-                    }
-                    sp += 1u;
-                } else if (tl <= tr) {
-                    idx = l;
-                } else {
-                    idx = l + 1u;
-                }
-                descended = true;
-            } else if (tl >= 0.0) {
-                idx = l;
-                descended = true;
-            } else if (tr >= 0.0) {
-                idx = l + 1u;
-                descended = true;
-            }
-        }
-        if (descended) {
-            continue;
-        }
-        if (sp == 0u) {
-            break;
-        }
-        sp -= 1u;
-        idx = stack[sp];
-    }
-    return false;
 }
 
 // Wächter & Binder 2019 ray-origin offset (`trace::offset_ray_origin`).
@@ -842,6 +798,8 @@ struct Mat {
     roughness: f32,
     normal: vec3<f32>,
     unlit: bool,
+    // Le at level 0 (factor × texture; 0 for unlit / black factor).
+    emission: vec3<f32>,
     ior: f32,
     specular: f32,
     specular_color: vec3<f32>,
@@ -890,68 +848,56 @@ fn material(h: Hit, surf: Surface, lod: Lod, flip: bool) -> Mat {
     let o = mat_off(m);
     let slot = h.slot;
     let b = h.b;
-    var r: Mat;
-    var col = tv4(o);
-    if (slot_present(m, S_BASE, slot)) {
-        col *= slot_sample(m, S_BASE, slot, b, lod);
+    // Every present texture slot, sampled once (absent = white, a
+    // no-op factor). The emissive slot is read at level 0 — it feeds
+    // `emission`, which the CPU samples at level 0 even for camera
+    // hits.
+    var tex: array<vec4<f32>, 13>;
+    var present = 0u;
+    for (var si = 0u; si < 13u; si++) {
+        tex[si] = vec4<f32>(1.0);
+        if (slot_present(m, si, slot)) {
+            present |= 1u << si;
+            var l = lod;
+            if (si == S_EMISSIVE) {
+                l = base_lod();
+            }
+            tex[si] = slot_sample(m, si, slot, b, l);
+        }
     }
+    var r: Mat;
+    var col = tv4(o) * tex[S_BASE];
     if ((attr_flags(slot) & F_COLORS) != 0u) {
         col *= interp4a(slot, 9u, b);
     }
     r.base = col;
-    var metallic = tf(o + 8u);
-    var roughness = tf(o + 9u);
-    if (slot_present(m, S_MR, slot)) {
-        let t = slot_sample(m, S_MR, slot, b, lod);
-        roughness *= t.y;
-        metallic *= t.z;
-    }
-    r.metallic = clamp(metallic, 0.0, 1.0);
-    r.roughness = clamp(roughness, 0.0, 1.0);
+    r.metallic = clamp(tf(o + 8u) * tex[S_MR].z, 0.0, 1.0);
+    r.roughness = clamp(tf(o + 9u) * tex[S_MR].y, 0.0, 1.0);
     r.normal = sn;
-    if (slot_present(m, S_NORMAL, slot)) {
-        r.normal = perturb(slot, b, sn, slot_sample(m, S_NORMAL, slot, b, lod), tf(o + 10u));
+    if ((present & (1u << S_NORMAL)) != 0u) {
+        r.normal = perturb(slot, b, sn, tex[S_NORMAL], tf(o + 10u));
     }
     r.unlit = (tables[o + M_FLAGS] & 8u) != 0u;
+    r.emission = vec3<f32>(0.0);
+    let e = tv3(o + 4u);
+    if (!r.unlit && !is_black(e)) {
+        r.emission = e * tex[S_EMISSIVE].xyz;
+    }
     r.ior = tf(o + 12u);
-    r.specular = tf(o + 13u);
-    if (slot_present(m, S_SPEC, slot)) {
-        r.specular *= slot_sample(m, S_SPEC, slot, b, lod).w;
-    }
-    r.specular_color = tv3(o + 14u);
-    if (slot_present(m, S_SPEC_COLOR, slot)) {
-        r.specular_color *= slot_sample(m, S_SPEC_COLOR, slot, b, lod).xyz;
-    }
-    r.transmission = tf(o + 17u);
-    if (slot_present(m, S_TRANSMISSION, slot)) {
-        r.transmission *= slot_sample(m, S_TRANSMISSION, slot, b, lod).x;
-    }
-    r.thickness = tf(o + 18u);
-    if (slot_present(m, S_THICKNESS, slot)) {
-        r.thickness *= slot_sample(m, S_THICKNESS, slot, b, lod).y;
-    }
+    r.specular = tf(o + 13u) * tex[S_SPEC].w;
+    r.specular_color = tv3(o + 14u) * tex[S_SPEC_COLOR].xyz;
+    r.transmission = tf(o + 17u) * tex[S_TRANSMISSION].x;
+    r.thickness = tf(o + 18u) * tex[S_THICKNESS].y;
     r.atten_color = tv3(o + 19u);
     r.atten_dist = tf(o + 22u);
-    r.clearcoat = tf(o + 23u);
-    if (slot_present(m, S_CC, slot)) {
-        r.clearcoat *= slot_sample(m, S_CC, slot, b, lod).x;
-    }
-    r.cc_rough = tf(o + 24u);
-    if (slot_present(m, S_CC_ROUGH, slot)) {
-        r.cc_rough *= slot_sample(m, S_CC_ROUGH, slot, b, lod).y;
-    }
+    r.clearcoat = tf(o + 23u) * tex[S_CC].x;
+    r.cc_rough = tf(o + 24u) * tex[S_CC_ROUGH].y;
     r.cc_normal = sn;
-    if (slot_present(m, S_CC_NORMAL, slot)) {
-        r.cc_normal = perturb(slot, b, sn, slot_sample(m, S_CC_NORMAL, slot, b, lod), tf(o + 25u));
+    if ((present & (1u << S_CC_NORMAL)) != 0u) {
+        r.cc_normal = perturb(slot, b, sn, tex[S_CC_NORMAL], tf(o + 25u));
     }
-    r.sheen = tv3(o + 26u);
-    if (slot_present(m, S_SHEEN_COLOR, slot)) {
-        r.sheen *= slot_sample(m, S_SHEEN_COLOR, slot, b, lod).xyz;
-    }
-    r.sheen_rough = tf(o + 29u);
-    if (slot_present(m, S_SHEEN_ROUGH, slot)) {
-        r.sheen_rough *= slot_sample(m, S_SHEEN_ROUGH, slot, b, lod).w;
-    }
+    r.sheen = tv3(o + 26u) * tex[S_SHEEN_COLOR].xyz;
+    r.sheen_rough = tf(o + 29u) * tex[S_SHEEN_ROUGH].w;
     return r;
 }
 
@@ -1739,10 +1685,6 @@ fn spawn(p: vec3<f32>, ng: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     return offset_ray_origin(p, -ng);
 }
 
-fn visible(o: vec3<f32>, d: vec3<f32>, t_max: f32, s: Sampler, ray_id: u32, skip: u32) -> bool {
-    return !occluded(make_ray(o, d), t_max, s, ray_id, skip);
-}
-
 // Light-sampling pdf of reaching emissive hit `h` (at `q`) from `p`.
 fn light_pdf(h: Hit, p: vec3<f32>, q: vec3<f32>) -> f32 {
     let li = tri_light(h.slot);
@@ -1757,6 +1699,18 @@ struct PathResult {
     radiance: vec3<f32>,
 };
 
+// One camera sample. The path is driven as a per-thread state machine
+// so the kernel holds a single traversal (and a single BSDF / texture
+// evaluation) call site — every loop iteration traces exactly one ray:
+//
+// * PATH: the continuation ray (camera ray at k = 0); its hit adds
+//   emission, builds the BSDF and arms the shadow-ray jobs;
+// * SHADOW: one NEE shadow ray (punctual lights j = 0..n−1 in order,
+//   then the area / environment sample) whose contribution is added
+//   when unoccluded.
+//
+// When the jobs run out the BSDF is sampled for the next PATH ray.
+// Contributions are added in the CPU integrator's order.
 fn trace_sample(x: u32, y: u32, index: u32) -> PathResult {
     let s = make_sampler(P.dims.z, x, y, index);
     let p0 = pattern(s, 0u);
@@ -1785,45 +1739,83 @@ fn trace_sample(x: u32, y: u32, index: u32) -> PathResult {
     let strategy = P.cfg.y;
     let has_env = P.env.z != 0u;
     let n_elights = P.cfg.w;
+    let n_punct = P.cfg.z;
     var k = 0u;
+
+    // Current ray.
+    var shadow = false;
+    var r_o = o;
+    var r_d = d;
+    var r_tmax = INF;
+    var r_id = 0u;
+    var r_skip = NONE;
+    // Pending shadow contribution.
+    var pending = vec3<f32>(0.0);
+    // Vertex state shared by the jobs and the BSDF sample.
+    var bsdf: Bsdf;
+    var p = vec3<f32>(0.0);
+    var ng = vec3<f32>(0.0);
+    var thickness = 0.0;
+    var transmission = 0.0;
+    var atten_color = vec3<f32>(1.0);
+    var atten_dist = -1.0;
+    var front = true;
+    var pl_u = vec4<f32>(0.0);
+    var job = 0u;
+
     loop {
-        let ray_id = k << 16u;
-        let hit = closest_hit(make_ray(o, d), INF, s, ray_id, k == 0u);
-        if (in_medium) {
+        let hit = traverse(make_ray(r_o, r_d), r_tmax, s, r_id, !shadow && k == 0u, shadow, r_skip);
+        if (shadow) {
             if (hit.slot == NONE) {
+                radiance += pending;
+            }
+            job += 1u;
+        } else {
+            if (in_medium) {
+                if (hit.slot == NONE) {
+                    break;
+                }
+                beta *= exp(-sigma * hit.t);
+            }
+            if (hit.slot == NONE) {
+                if (k == 0u) {
+                    return PathResult(false, vec3<f32>(0.0));
+                }
+                var le = vec3<f32>(P.fparams.x);
+                var w = 1.0;
+                if (has_env) {
+                    le = env_radiance(d);
+                    if (strategy == 0u) {
+                        w = power_heuristic(prev_pdf, p_env() * env_pdf(d));
+                    } else if (strategy == 1u) {
+                        w = 0.0;
+                    }
+                }
+                if (w > 0.0) {
+                    radiance += clamp_c(beta * le * w);
+                }
                 break;
             }
-            beta *= exp(-sigma * hit.t);
-        }
-        if (hit.slot == NONE) {
+            let surf = surface(hit);
+            let mflags = mat_flags(tri_material(hit.slot));
+            let double_sided = (mflags & 4u) != 0u;
+            var lod = base_lod();
             if (k == 0u) {
-                return PathResult(false, vec3<f32>(0.0));
-            }
-            var le = vec3<f32>(P.fparams.x);
-            var w = 1.0;
-            if (has_env) {
-                le = env_radiance(d);
-                if (strategy == 0u) {
-                    w = power_heuristic(prev_pdf, p_env() * env_pdf(d));
-                } else if (strategy == 1u) {
-                    w = 0.0;
+                var cw = P.up.w;
+                if (!orthographic) {
+                    cw = P.up.w * hit.t;
                 }
+                lod = Lod(cw, d);
             }
-            if (w > 0.0) {
-                radiance += clamp_c(beta * le * w);
+            let flip = !hit.front && double_sided;
+            var mat = material(hit, surf, lod, flip);
+            if (flip) {
+                mat.normal = -mat.normal;
+                mat.cc_normal = -mat.cc_normal;
             }
-            break;
-        }
-        let surf = surface(hit);
-        let mi = tri_material(hit.slot);
-        let mflags = mat_flags(mi);
-        let double_sided = (mflags & 4u) != 0u;
-        let unlit = (mflags & 8u) != 0u;
-
-        // Emission.
-        if ((hit.front || double_sided) && !unlit && (mflags & 16u) != 0u) {
-            let le = emission(hit);
-            if (!is_black(le)) {
+            // Emission.
+            if ((hit.front || double_sided) && !is_black(mat.emission)) {
+                let le = mat.emission;
                 if (k == 0u) {
                     radiance += beta * le;
                 } else {
@@ -1841,168 +1833,170 @@ fn trace_sample(x: u32, y: u32, index: u32) -> PathResult {
                     }
                 }
             }
-        }
-        var lod = base_lod();
-        if (k == 0u) {
-            var cw = P.up.w;
-            if (!orthographic) {
-                cw = P.up.w * hit.t;
-            }
-            lod = Lod(cw, d);
-        }
-        let flip = !hit.front && double_sided;
-        var mat = material(hit, surf, lod, flip);
-        if (flip) {
-            mat.normal = -mat.normal;
-            mat.cc_normal = -mat.cc_normal;
-        }
-        if (mat.unlit) {
-            let contrib = beta * mat.base.xyz;
-            if (k == 0u) {
-                radiance += contrib;
-            } else {
-                radiance += clamp_c(contrib);
-            }
-            break;
-        }
-        if (k >= P.dims.w) {
-            break;
-        }
-        let v = -d;
-        let bsdf = make_bsdf(mat, v, surf.ng, hit.front);
-        if (bsdf_black(bsdf)) {
-            break;
-        }
-        let p = surf.position;
-        let ng = bsdf.ng;
-
-        // NEE: punctual lights.
-        for (var j = 0u; j < P.cfg.z; j++) {
-            let ls = punctual_sample(j, p);
-            if (!ls.ok) {
-                continue;
-            }
-            let f = bsdf_eval(bsdf, ls.l).f;
-            if (is_black(f)) {
-                continue;
-            }
-            var tmax = INF;
-            if (ls.distance >= 0.0) {
-                tmax = ls.distance * (1.0 - 1.0e-4);
-            }
-            if (visible(spawn(p, ng, ls.l), ls.l, tmax, s, ray_id | 0x8000u | (j & 0x7fffu), NONE)) {
-                radiance += clamp_c(beta * f * ls.radiance);
-            }
-        }
-
-        // NEE: area uvset.
-        let pl_u = pattern(s, 2u + 2u * k);
-        if (strategy != 2u && (has_env || n_elights > 0u)) {
-            let pe = p_env();
-            let shadow_id = ray_id | 0xffffu;
-            if (pl_u.z < pe) {
-                if (has_env) {
-                    let es = env_sample(pl_u.x, pl_u.y);
-                    if (es.ok) {
-                        let pl = pe * es.pdf;
-                        let e = bsdf_eval(bsdf, es.d);
-                        if (!is_black(e.f) && !is_black(es.le) && pl > 0.0) {
-                            var w = 1.0;
-                            if (strategy == 0u) {
-                                w = power_heuristic(pl, e.pdf);
-                            }
-                            if (visible(spawn(p, ng, es.d), es.d, INF, s, shadow_id, NONE)) {
-                                radiance += clamp_c(beta * e.f * es.le * (w / pl));
-                            }
-                        }
-                    }
-                }
-            } else if (n_elights > 0u) {
-                var us = pl_u.z;
-                if (pe > 0.0) {
-                    us = clamp((pl_u.z - pe) / (1.0 - pe), 0.0, 0.999999);
-                }
-                let li = pick_elight(us);
-                let lslot = elight_slot(li);
-                let a = tri_pos(lslot, 0u);
-                let b = tri_pos(lslot, 1u);
-                let c = tri_pos(lslot, 2u);
-                var has_target = false;
-                var q = vec3<f32>(0.0);
-                if (triangle_solid_angle(p, a, b, c) >= MIN_SPHERICAL_SOLID_ANGLE) {
-                    let l = sample_spherical_triangle(p, a, b, c, pl_u.x, pl_u.y);
-                    if (dot(l, l) > 0.0) {
-                        let n = cross(b - a, c - a);
-                        let dn = dot(l, n);
-                        if (dn != 0.0) {
-                            let t = dot(a - p, n) / dn;
-                            if (t > 0.0 && finite(t)) {
-                                q = p + l * t;
-                                has_target = true;
-                            }
-                        }
-                    }
+            if (mat.unlit) {
+                let contrib = beta * mat.base.xyz;
+                if (k == 0u) {
+                    radiance += contrib;
                 } else {
-                    let su = sqrt(pl_u.x);
-                    let w3 = vec3<f32>(1.0 - su, su * (1.0 - pl_u.y), su * pl_u.y);
-                    q = a * w3.x + b * w3.y + c * w3.z;
-                    has_target = true;
+                    radiance += clamp_c(contrib);
                 }
-                // barycentric_of.
-                var bary_ok = false;
-                var bary = vec3<f32>(0.0);
-                if (has_target) {
-                    let e1 = b - a;
-                    let e2 = c - a;
-                    let rr = q - a;
-                    let d11 = dot(e1, e1);
-                    let d12 = dot(e1, e2);
-                    let d22 = dot(e2, e2);
-                    let r1 = dot(rr, e1);
-                    let r2 = dot(rr, e2);
-                    let det = d11 * d22 - d12 * d12;
-                    if (finite(det) && abs(det) > 1.17549435e-38) {
-                        let bu = (d22 * r1 - d12 * r2) / det;
-                        let bv = (d11 * r2 - d12 * r1) / det;
-                        bary = clamp(vec3<f32>(1.0 - bu - bv, bu, bv), vec3<f32>(0.0), vec3<f32>(1.0));
-                        bary_ok = true;
+                break;
+            }
+            if (k >= P.dims.w) {
+                break;
+            }
+            bsdf = make_bsdf(mat, -d, surf.ng, hit.front);
+            if (bsdf_black(bsdf)) {
+                break;
+            }
+            p = surf.position;
+            ng = bsdf.ng;
+            thickness = mat.thickness;
+            transmission = mat.transmission;
+            atten_color = mat.atten_color;
+            atten_dist = mat.atten_dist;
+            front = hit.front;
+            pl_u = pattern(s, 2u + 2u * k);
+            job = 0u;
+        }
+
+        // ---- Next NEE shadow ray (punctual j < n, then the area set).
+        var armed = false;
+        let ray_id = k << 16u;
+        loop {
+            if (job > n_punct) {
+                break;
+            }
+            var ok = false;
+            var l = vec3<f32>(0.0);
+            var tmax = INF;
+            var rid = ray_id | 0xffffu;
+            var skip = NONE;
+            var le = vec3<f32>(0.0);
+            // Light pdf (area set); < 0 = punctual (weight 1).
+            var pl = -1.0;
+            if (job < n_punct) {
+                let ls = punctual_sample(job, p);
+                if (ls.ok) {
+                    ok = true;
+                    l = ls.l;
+                    if (ls.distance >= 0.0) {
+                        tmax = ls.distance * (1.0 - 1.0e-4);
                     }
+                    rid = ray_id | 0x8000u | (job & 0x7fffu);
+                    le = ls.radiance;
                 }
-                if (bary_ok) {
-                    let to = q - p;
-                    let dist2 = dot(to, to);
-                    var lh: Hit;
-                    lh.slot = lslot;
-                    lh.t = sqrt(dist2);
-                    lh.b = bary;
-                    lh.front = true;
-                    let lsurf = surface(lh);
-                    let lds = mat_double_sided(tri_material(lslot));
-                    if (dist2 > 1.0e-12) {
-                        let dist = sqrt(dist2);
-                        let l = to / dist;
-                        let cos_l = -dot(lsurf.ng, l);
-                        let pl = tri_pdf(li, lslot, p, q);
-                        if ((cos_l > 0.0 || (lds && cos_l < 0.0)) && pl > 0.0 && finite(pl)) {
-                            let e = bsdf_eval(bsdf, l);
-                            let le = emission(lh);
-                            if (!is_black(e.f) && !is_black(le)) {
-                                var w = 1.0;
-                                if (strategy == 0u) {
-                                    w = power_heuristic(pl, e.pdf);
+            } else if (strategy != 2u && (has_env || n_elights > 0u)) {
+                let pe = p_env();
+                if (pl_u.z < pe) {
+                    if (has_env) {
+                        let es = env_sample(pl_u.x, pl_u.y);
+                        if (es.ok && pe * es.pdf > 0.0) {
+                            ok = true;
+                            l = es.d;
+                            le = es.le;
+                            pl = pe * es.pdf;
+                        }
+                    }
+                } else if (n_elights > 0u) {
+                    var us = pl_u.z;
+                    if (pe > 0.0) {
+                        us = clamp((pl_u.z - pe) / (1.0 - pe), 0.0, 0.999999);
+                    }
+                    let li = pick_elight(us);
+                    let lslot = elight_slot(li);
+                    let a = tri_pos(lslot, 0u);
+                    let b = tri_pos(lslot, 1u);
+                    let c = tri_pos(lslot, 2u);
+                    var has_target = false;
+                    var q = vec3<f32>(0.0);
+                    if (triangle_solid_angle(p, a, b, c) >= MIN_SPHERICAL_SOLID_ANGLE) {
+                        let sl = sample_spherical_triangle(p, a, b, c, pl_u.x, pl_u.y);
+                        if (dot(sl, sl) > 0.0) {
+                            let n = cross(b - a, c - a);
+                            let dn = dot(sl, n);
+                            if (dn != 0.0) {
+                                let t = dot(a - p, n) / dn;
+                                if (t > 0.0 && finite(t)) {
+                                    q = p + sl * t;
+                                    has_target = true;
                                 }
-                                let tmax = max(dist * (1.0 - 1.0e-4), 0.0);
-                                if (visible(spawn(p, ng, l), l, tmax, s, shadow_id, tri_global(lslot))) {
-                                    radiance += clamp_c(beta * e.f * le * (w / pl));
-                                }
+                            }
+                        }
+                    } else {
+                        let su = sqrt(pl_u.x);
+                        let w3 = vec3<f32>(1.0 - su, su * (1.0 - pl_u.y), su * pl_u.y);
+                        q = a * w3.x + b * w3.y + c * w3.z;
+                        has_target = true;
+                    }
+                    if (has_target) {
+                        // barycentric_of.
+                        let e1 = b - a;
+                        let e2 = c - a;
+                        let rr = q - a;
+                        let d11 = dot(e1, e1);
+                        let d12 = dot(e1, e2);
+                        let d22 = dot(e2, e2);
+                        let r1 = dot(rr, e1);
+                        let r2 = dot(rr, e2);
+                        let det = d11 * d22 - d12 * d12;
+                        let to = q - p;
+                        let dist2 = dot(to, to);
+                        if (finite(det) && abs(det) > 1.17549435e-38 && dist2 > 1.0e-12) {
+                            let bu = (d22 * r1 - d12 * r2) / det;
+                            let bv = (d11 * r2 - d12 * r1) / det;
+                            var lh: Hit;
+                            lh.slot = lslot;
+                            lh.t = sqrt(dist2);
+                            lh.b = clamp(vec3<f32>(1.0 - bu - bv, bu, bv), vec3<f32>(0.0), vec3<f32>(1.0));
+                            lh.front = true;
+                            let lng = surface(lh).ng;
+                            let lds = mat_double_sided(tri_material(lslot));
+                            let dist = sqrt(dist2);
+                            let ld = to / dist;
+                            let cos_l = -dot(lng, ld);
+                            let tp = tri_pdf(li, lslot, p, q);
+                            if ((cos_l > 0.0 || (lds && cos_l < 0.0)) && tp > 0.0 && finite(tp)) {
+                                ok = true;
+                                l = ld;
+                                le = emission(lh);
+                                pl = tp;
+                                tmax = max(dist * (1.0 - 1.0e-4), 0.0);
+                                skip = tri_global(lslot);
                             }
                         }
                     }
                 }
             }
+            if (ok) {
+                let e = bsdf_eval(bsdf, l);
+                if (!is_black(e.f) && !is_black(le)) {
+                    if (pl < 0.0) {
+                        pending = clamp_c(beta * e.f * le);
+                    } else {
+                        var w = 1.0;
+                        if (strategy == 0u) {
+                            w = power_heuristic(pl, e.pdf);
+                        }
+                        pending = clamp_c(beta * e.f * le * (w / pl));
+                    }
+                    r_o = spawn(p, ng, l);
+                    r_d = l;
+                    r_tmax = tmax;
+                    r_id = rid;
+                    r_skip = skip;
+                    armed = true;
+                    break;
+                }
+            }
+            job += 1u;
+        }
+        if (armed) {
+            shadow = true;
+            continue;
         }
 
-        // BSDF sampling.
+        // ---- BSDF sampling → next PATH ray.
         let pb_u = pattern(s, 1u + 2u * k);
         let bs = bsdf_sample(bsdf, pb_u.xyz);
         if (!bs.ok) {
@@ -2014,11 +2008,10 @@ fn trace_sample(x: u32, y: u32, index: u32) -> PathResult {
         }
         prev_pdf = bs.pdf;
         prev_pos = p;
-        if (dot(bs.l, ng) < 0.0 && mat.thickness > 0.0 && mat.transmission > 0.0) {
-            if (hit.front) {
-                if (mat.atten_dist >= 0.0) {
-                    let c = mat.atten_color;
-                    sigma = -log(max(c, vec3<f32>(1.0e-6))) / mat.atten_dist;
+        if (dot(bs.l, ng) < 0.0 && thickness > 0.0 && transmission > 0.0) {
+            if (front) {
+                if (atten_dist >= 0.0) {
+                    sigma = -log(max(atten_color, vec3<f32>(1.0e-6))) / atten_dist;
                     in_medium = true;
                 } else {
                     in_medium = false;
@@ -2036,9 +2029,14 @@ fn trace_sample(x: u32, y: u32, index: u32) -> PathResult {
                 beta = beta * (1.0 / q);
             }
         }
-        o = spawn(p, ng, bs.l);
-        d = bs.l;
         k += 1u;
+        d = bs.l;
+        shadow = false;
+        r_o = spawn(p, ng, bs.l);
+        r_d = d;
+        r_tmax = INF;
+        r_id = k << 16u;
+        r_skip = NONE;
     }
     if (finite3(radiance)) {
         return PathResult(true, radiance);
