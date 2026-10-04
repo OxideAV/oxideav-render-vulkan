@@ -1,6 +1,7 @@
 //! Render a procedural scene with both the GPU backend and the
 //! scanline CPU backend and write the two frames as binary PPM (P6)
-//! files for side-by-side inspection.
+//! files for side-by-side inspection, plus a GPU `Pbr` sphere grid
+//! (`gpu_pbr.ppm`: metallic rises left→right, roughness top→bottom).
 //!
 //! `cargo run --example gpu_vs_cpu -- <out-dir>`
 
@@ -87,5 +88,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_ppm(&dir.join("gpu.ppm"), &gpu.render(&scene, &opts)?)?;
     let mut cpu = make_renderer(RenderBackend::Scanline)?;
     write_ppm(&dir.join("cpu.ppm"), &cpu.render(&scene, &opts)?)?;
+
+    // Pbr grid: 5 metallic steps × 4 roughness steps.
+    let mut grid = Scene3D::new();
+    let mut mesh = Mesh::default();
+    mesh.primitives.push(sphere(48, 24));
+    grid.meshes.push(mesh);
+    for r in 0..4 {
+        for m in 0..5 {
+            grid.materials.push(Material {
+                base_color: [0.9, 0.55, 0.2, 1.0],
+                metallic: m as f32 / 4.0,
+                roughness: 0.1 + 0.3 * r as f32,
+                ..Material::default()
+            });
+            let mut mesh = Mesh::default();
+            let mut prim = sphere(48, 24);
+            prim.material = Some(MaterialId((r * 5 + m) as u32));
+            mesh.primitives.push(prim);
+            grid.meshes.push(mesh);
+            grid.nodes.push(Node {
+                mesh: Some(MeshId(grid.meshes.len() as u32 - 1)),
+                transform: oxideav_mesh3d::Transform::Trs {
+                    translation: [m as f32 * 2.2, -(r as f32) * 2.2, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0; 3],
+                },
+                ..Node::default()
+            });
+            grid.roots.push(NodeId(grid.nodes.len() as u32 - 1));
+        }
+    }
+    let pbr = RenderOptions {
+        width: 640,
+        height: 520,
+        shading: ShadingMode::Pbr,
+        camera: None,
+        tone_map: oxideav_render::ToneMap::AcesFitted,
+        exposure: 1.5,
+        ambient: 0.15,
+        ..opts
+    };
+    write_ppm(&dir.join("gpu_pbr.ppm"), &gpu.render(&grid, &pbr)?)?;
     Ok(())
 }

@@ -228,7 +228,7 @@ fn registry_constructs_gpu_backend() {
 #[test]
 fn upload_once_draw_many() {
     let Some(mut r) = gpu() else { return };
-    let mut gs = r.upload(&cube_scene());
+    let mut gs = r.upload(&cube_scene(), &opts(ShadingMode::Phong));
     assert_eq!(gs.triangle_count(), 12);
     for mode in [
         ShadingMode::Phong,

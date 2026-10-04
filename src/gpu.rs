@@ -1,38 +1,78 @@
-//! wgpu device, pipelines and the offscreen draw + readback path.
+//! wgpu device, pipelines, and the two-pass frame:
+//!
+//! 1. **scene pass** at `aa ×` the output size into an `Rgba16Float`
+//!    scene-linear target plus an `R8Unorm` coverage mask, with depth;
+//! 2. **resolve pass** at output size: tone map, background composite,
+//!    supersample average, sRGB encode into `Rgba8Unorm`.
 
 use bytemuck::{Pod, Zeroable};
-use oxideav_render::{Error, RenderOptions, Result, RgbaImage, ShadingMode};
+use oxideav_render::prepare::{DrawTopology, LightKind, PrepareOptions, PreparedLight};
+use oxideav_render::{
+    Camera, DepthRange, Error, PreparedScene, RenderOptions, Result, RgbaImage, ShadingMode,
+    TextureCache, ToneMap,
+};
 use wgpu::util::DeviceExt;
 
-use crate::camera::{light_direction, view_proj};
-use crate::flatten::{flatten, Bounds, Vertex};
-use crate::math::to_column_major;
+use crate::scene::{
+    material_layout, GpuScene, Pass, ResourceCache, Uploader, Vertex, VERTEX_ATTRIBUTES,
+};
 use crate::GpuBackend;
 
-/// Colour target format. Plain UNORM: the fragment shader performs
-/// the sRGB encode itself (see `shaders/scene.wgsl`).
+/// Output format of the resolve pass (holds sRGB-encoded values).
 pub(crate) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const COVERAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-/// Ambient term — identical to the scanline backend's.
-const AMBIENT: f32 = 0.2;
+/// Legacy-mode ambient term — identical to the scanline backend's.
+const LEGACY_AMBIENT: f32 = 0.2;
+const MAX_LIGHTS: usize = 16;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, Pod, Zeroable)]
+struct LightUniform {
+    position: [f32; 4],
+    direction: [f32; 4],
+    radiance: [f32; 4],
+    cone: [f32; 4],
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Globals {
     view_proj: [[f32; 4]; 4],
-    light: [f32; 4],
+    eye: [f32; 4],
+    legacy_light: [f32; 4],
     params: [f32; 4],
     mode: [u32; 4],
+    lights: [LightUniform; MAX_LIGHTS],
 }
 
-/// Offscreen colour + depth targets, cached across frames of the same
-/// size.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct ResolveParams {
+    cfg: [u32; 4],
+    exposure: [f32; 4],
+    background: [f32; 4],
+}
+
+/// Frame targets, cached across frames of the same geometry.
 struct Targets {
-    width: u32,
-    height: u32,
-    color: wgpu::Texture,
-    color_view: wgpu::TextureView,
+    key: (u32, u32, u32, u32),
+    hdr_view: wgpu::TextureView,
+    coverage_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    output: wgpu::Texture,
+    output_view: wgpu::TextureView,
+}
+
+struct Pipelines {
+    /// `[cull none, cull back]`.
+    opaque: [wgpu::RenderPipeline; 2],
+    /// `[cull none, cull back]`, premultiplied over, no depth write.
+    blend: [wgpu::RenderPipeline; 2],
+    lines: wgpu::RenderPipeline,
+    points: wgpu::RenderPipeline,
+    resolve: wgpu::RenderPipeline,
 }
 
 /// A live GPU device with the scene pipelines compiled.
@@ -41,14 +81,30 @@ pub(crate) struct GpuContext {
     queue: wgpu::Queue,
     adapter_info: wgpu::AdapterInfo,
     max_dim: u32,
-    bind_group_layout: wgpu::BindGroupLayout,
-    tri_pipeline: wgpu::RenderPipeline,
-    line_pipeline: wgpu::RenderPipeline,
+    globals_layout: wgpu::BindGroupLayout,
+    material_layout: wgpu::BindGroupLayout,
+    resolve_layout: wgpu::BindGroupLayout,
+    pipelines: Pipelines,
+    cache: ResourceCache,
     targets: Option<Targets>,
+    texture_cache: TextureCache,
 }
 
 fn backend_err(what: &str, e: impl std::fmt::Display) -> Error {
     Error::Backend(format!("wgpu: {what}: {e}"))
+}
+
+fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 impl GpuContext {
@@ -103,89 +159,44 @@ impl GpuContext {
         adapter_info: wgpu::AdapterInfo,
     ) -> Self {
         let max_dim = device.limits().max_texture_dimension_2d;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("scene.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/scene.wgsl").into()),
-        });
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT)],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scene"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let make = |topology: wgpu::PrimitiveTopology, label: &str| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![
-                            0 => Float32x3,
-                            1 => Float32x3,
-                            2 => Float32x4
-                        ],
-                    }],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: COLOR_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    // The scanline backend draws both faces; match it.
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
+        let material_layout = material_layout(&device);
+        let scene_texture = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
         };
-        let tri_pipeline = make(wgpu::PrimitiveTopology::TriangleList, "scene-triangles");
-        let line_pipeline = make(wgpu::PrimitiveTopology::LineList, "scene-lines");
+        let resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("resolve"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::FRAGMENT),
+                scene_texture(1),
+                scene_texture(2),
+            ],
+        });
+        let pipelines =
+            build_pipelines(&device, &globals_layout, &material_layout, &resolve_layout);
+        let cache = ResourceCache::new(&device, &queue);
         Self {
             device,
             queue,
             adapter_info,
             max_dim,
-            bind_group_layout,
-            tri_pipeline,
-            line_pipeline,
+            globals_layout,
+            material_layout,
+            resolve_layout,
+            pipelines,
+            cache,
             targets: None,
+            texture_cache: TextureCache::default(),
         }
     }
 
@@ -193,265 +204,470 @@ impl GpuContext {
         &self.adapter_info
     }
 
-    fn ensure_targets(&mut self, width: u32, height: u32) {
-        let stale = self
-            .targets
-            .as_ref()
-            .is_none_or(|t| t.width != width || t.height != height);
-        if stale {
-            let size = wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            };
-            let tex = |format, usage, label| {
-                self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size,
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage,
-                    view_formats: &[],
-                })
-            };
-            let color = tex(
-                COLOR_FORMAT,
-                wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                "color",
-            );
-            let depth = tex(
-                DEPTH_FORMAT,
-                wgpu::TextureUsages::RENDER_ATTACHMENT,
-                "depth",
-            );
-            self.targets = Some(Targets {
-                width,
-                height,
-                color_view: color.create_view(&Default::default()),
-                depth_view: depth.create_view(&Default::default()),
-                color,
-            });
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub(crate) fn texture_cache_mut(&mut self) -> &mut TextureCache {
+        &mut self.texture_cache
+    }
+
+    /// Prepare `scene` (pose at `opts.time`, textures, lights,
+    /// cameras) and upload it.
+    pub(crate) fn upload(
+        &mut self,
+        scene: &oxideav_mesh3d::Scene3D,
+        opts: &RenderOptions,
+    ) -> GpuScene {
+        let mut popts = PrepareOptions::from_render_options(opts);
+        // Scene lights are always kept; whether they are used is a
+        // draw-time choice (`use_scene_lights`).
+        popts.use_scene_lights = true;
+        popts.generate_tangents = true;
+        let prepared = PreparedScene::build(scene, &popts, &mut self.texture_cache);
+        Uploader {
+            device: &self.device,
+            queue: &self.queue,
+            material_layout: &self.material_layout,
+            cache: &mut self.cache,
         }
+        .upload(prepared)
     }
 
-    /// Upload `scene` (flattened to world space) into GPU vertex
-    /// buffers. The result can be drawn any number of times with
-    /// different options; wireframe edges are derived on first use.
-    pub(crate) fn upload(&self, scene: &oxideav_mesh3d::Scene3D) -> GpuScene {
-        let flat = flatten(scene);
-        let bounds = flat.bounds_or_unit();
-        GpuScene {
-            triangles: self.vertex_buffer(&flat.triangles, "triangles"),
-            lines: self.vertex_buffer(&flat.lines, "lines"),
-            edges: None,
-            cpu_triangles: flat.triangles,
-            bounds,
+    fn ensure_targets(&mut self, rw: u32, rh: u32, w: u32, h: u32) {
+        let key = (rw, rh, w, h);
+        if self.targets.as_ref().is_some_and(|t| t.key == key) {
+            return;
         }
+        let tex = |width, height, format, usage, label| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let attach = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let hdr = tex(rw, rh, HDR_FORMAT, attach, "scene hdr");
+        let coverage = tex(rw, rh, COVERAGE_FORMAT, attach, "scene coverage");
+        let depth = tex(
+            rw,
+            rh,
+            DEPTH_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+            "scene depth",
+        );
+        let output = tex(
+            w,
+            h,
+            COLOR_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            "output",
+        );
+        self.targets = Some(Targets {
+            key,
+            hdr_view: hdr.create_view(&Default::default()),
+            coverage_view: coverage.create_view(&Default::default()),
+            depth_view: depth.create_view(&Default::default()),
+            output_view: output.create_view(&Default::default()),
+            output,
+        });
     }
 
-    fn vertex_buffer(&self, data: &[Vertex], label: &str) -> Option<(wgpu::Buffer, u32)> {
-        (!data.is_empty()).then(|| {
-            let buf = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(label),
-                    contents: bytemuck::cast_slice(data),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            (buf, data.len() as u32)
-        })
-    }
-
-    fn check_size(&self, width: u32, height: u32) -> Result<()> {
-        if width > self.max_dim || height > self.max_dim {
-            return Err(Error::InvalidOptions(format!(
-                "{width}x{height} exceeds the GPU's {} max texture dimension",
-                self.max_dim
-            )));
+    /// Supersampling factor that fits the device limits.
+    fn effective_aa(&self, opts: &RenderOptions, w: u32, h: u32) -> u32 {
+        let mut aa = opts.aa.clamp(1, 8);
+        while aa > 1 && (w * aa > self.max_dim || h * aa > self.max_dim) {
+            aa -= 1;
         }
-        Ok(())
+        aa
     }
 
-    /// Record the scene pass into `encoder`, targeting the cached
-    /// offscreen targets (resized to `width × height`).
-    fn encode_scene(
+    /// Draw `gs` at `opts.width × opts.height` (supersampled by
+    /// `opts.aa`) into the output texture and submit.
+    pub(crate) fn draw(
+        &mut self,
+        gs: &mut GpuScene,
+        opts: &RenderOptions,
+    ) -> Result<&wgpu::Texture> {
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.encode_frame(&mut encoder, gs, opts)?;
+        self.queue.submit([encoder.finish()]);
+        Ok(&self.targets.as_ref().expect("targets ensured").output)
+    }
+
+    fn encode_frame(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         gs: &mut GpuScene,
         opts: &RenderOptions,
-        width: u32,
-        height: u32,
-    ) {
-        let wireframe = opts.shading == ShadingMode::Wireframe;
-        if wireframe && gs.edges.is_none() {
-            let edges: Vec<Vertex> = gs
-                .cpu_triangles
-                .chunks_exact(3)
-                .flat_map(|t| [t[0], t[1], t[1], t[2], t[2], t[0]])
-                .collect();
-            gs.edges = Some(self.vertex_buffer(&edges, "edges"));
+    ) -> Result<()> {
+        let (w, h) = (opts.width.max(1), opts.height.max(1));
+        if w > self.max_dim || h > self.max_dim {
+            return Err(Error::InvalidOptions(format!(
+                "{w}x{h} exceeds the GPU's {} max texture dimension",
+                self.max_dim
+            )));
         }
-        let mode = match opts.shading {
-            ShadingMode::Flat => 0,
-            ShadingMode::Gouraud => 1,
-            ShadingMode::Phong => 2,
-            ShadingMode::Wireframe => 3,
-            ShadingMode::NormalDebug => 4,
-            ShadingMode::DepthDebug => 5,
-            // Future modes fall back to per-fragment lighting.
-            #[allow(unreachable_patterns)]
-            _ => 2,
+        let aa = self.effective_aa(opts, w, h);
+        let (rw, rh) = (w * aa, h * aa);
+        self.ensure_targets(rw, rh, w, h);
+
+        let mode = shading_code(opts.shading);
+        let pbr = mode == 6;
+        let wireframe = opts.shading == ShadingMode::Wireframe;
+        let camera = Camera::resolve(&gs.prepared, opts, rw, rh);
+
+        // Lights.
+        let fallback;
+        let lights: &[PreparedLight] = if opts.use_scene_lights && !gs.scene_lights.is_empty() {
+            &gs.scene_lights
+        } else {
+            fallback = [PreparedLight::from_light_spec(opts.light)];
+            &fallback
         };
-        let light = light_direction(opts);
+        let mut light_uniforms = [LightUniform::default(); MAX_LIGHTS];
+        for (u, l) in light_uniforms.iter_mut().zip(lights) {
+            let kind = match l.kind {
+                LightKind::Directional => 0.0,
+                LightKind::Point => 1.0,
+                _ => 2.0,
+            };
+            *u = LightUniform {
+                position: [l.position[0], l.position[1], l.position[2], kind],
+                direction: [
+                    l.direction[0],
+                    l.direction[1],
+                    l.direction[2],
+                    l.range.unwrap_or(0.0),
+                ],
+                radiance: [
+                    l.color[0] * l.intensity,
+                    l.color[1] * l.intensity,
+                    l.color[2] * l.intensity,
+                    0.0,
+                ],
+                cone: [l.inner_cone_angle.cos(), l.outer_cone_angle.cos(), 0.0, 0.0],
+            };
+        }
+        let legacy = {
+            let az = opts.light.azimuth_deg.to_radians();
+            let el = opts.light.elevation_deg.to_radians();
+            let d = [el.cos() * az.sin(), el.sin(), el.cos() * az.cos()];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-12);
+            [
+                d[0] / len,
+                d[1] / len,
+                d[2] / len,
+                opts.light.intensity.max(0.0),
+            ]
+        };
+        let vp = camera.view_projection(DepthRange::ZeroToOne);
         let globals = Globals {
-            view_proj: to_column_major(&view_proj(width, height, gs.bounds, opts)),
-            light: [light[0], light[1], light[2], opts.light.intensity.max(0.0)],
-            params: [AMBIENT, 0.0, 0.0, 0.0],
-            mode: [mode, 0, 0, 0],
+            view_proj: std::array::from_fn(|c| std::array::from_fn(|r| vp[r][c])),
+            eye: [camera.eye[0], camera.eye[1], camera.eye[2], 1.0],
+            legacy_light: legacy,
+            params: [LEGACY_AMBIENT, opts.ambient.max(0.0), 0.0, 0.0],
+            mode: [mode, lights.len().min(MAX_LIGHTS) as u32, 0, 0],
+            lights: light_uniforms,
         };
-        let uniform = self
+        let globals_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("globals"),
                 contents: bytemuck::bytes_of(&globals),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let globals_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
-            layout: &self.bind_group_layout,
+            layout: &self.globals_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: uniform.as_entire_binding(),
+                resource: globals_buf.as_entire_binding(),
             }],
         });
 
-        self.ensure_targets(width, height);
+        // Wireframe edges (legacy) and sorted BLEND triangles (Pbr).
+        if wireframe && gs.edges.is_none() {
+            let mut idx = Vec::new();
+            for it in gs
+                .items
+                .iter()
+                .filter(|i| i.topology == DrawTopology::Triangles)
+            {
+                for t in (it.first..it.first + it.count).step_by(3) {
+                    idx.extend_from_slice(&[t, t + 1, t + 1, t + 2, t + 2, t]);
+                }
+            }
+            gs.edges = Some(self.index_buffer(&idx, "edges"));
+        }
+        let mut blend_runs: Vec<(usize, std::ops::Range<u32>)> = Vec::new();
+        let blend_buf = if pbr && !gs.blend_tris.is_empty() {
+            let mut order: Vec<(f32, usize)> = gs
+                .blend_tris
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let d: f32 = (0..3)
+                        .map(|k| (t.centroid[k] - camera.eye[k]) * camera.forward[k])
+                        .sum();
+                    (d, i)
+                })
+                .collect();
+            // Back to front: farthest view depth first.
+            order.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let mut idx = Vec::with_capacity(order.len() * 3);
+            for (_, i) in &order {
+                let t = gs.blend_tris[*i];
+                let start = idx.len() as u32;
+                idx.extend_from_slice(&[t.first, t.first + 1, t.first + 2]);
+                match blend_runs.last_mut() {
+                    Some((m, r)) if *m == t.material => r.end = start + 3,
+                    _ => blend_runs.push((t.material, start..start + 3)),
+                }
+            }
+            self.index_buffer(&idx, "blend order")
+        } else {
+            None
+        };
+
         let targets = self.targets.as_ref().expect("targets ensured above");
-        let bg = opts.background.0.map(|c| c as f64 / 255.0);
+        let bg = opts.background.0.map(|c| c as f32 / 255.0);
+        let bg_lin = bg.map(|c| oxideav_render::hdr::srgb_to_linear(c) as f64);
+        let clear = if pbr {
+            let a = bg[3] as f64;
+            wgpu::Color {
+                r: bg_lin[0] * a,
+                g: bg_lin[1] * a,
+                b: bg_lin[2] * a,
+                a,
+            }
+        } else {
+            wgpu::Color::TRANSPARENT
+        };
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.hdr_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(clear),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.coverage_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &targets.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(vbuf) = &gs.vertices {
+                pass.set_bind_group(0, &globals_bg, &[]);
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                let p = &self.pipelines;
+                if wireframe {
+                    if let Some(Some((ibuf, _))) = &gs.edges {
+                        // Each item keeps its own material colour, so
+                        // edges are drawn per item.
+                        pass.set_pipeline(&p.lines);
+                        pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        let mut at = 0u32;
+                        for it in gs
+                            .items
+                            .iter()
+                            .filter(|i| i.topology == DrawTopology::Triangles)
+                        {
+                            let k = it.count * 2;
+                            pass.set_bind_group(1, &gs.materials[it.material].bind_group, &[]);
+                            pass.draw_indexed(at..at + k, 0, 0..1);
+                            at += k;
+                        }
+                    }
+                } else {
+                    for it in gs
+                        .items
+                        .iter()
+                        .filter(|i| i.topology == DrawTopology::Triangles)
+                    {
+                        let m = &gs.materials[it.material];
+                        if pbr && m.pass == Pass::Blend {
+                            continue;
+                        }
+                        let cull = usize::from(pbr && !m.double_sided);
+                        pass.set_pipeline(&p.opaque[cull]);
+                        pass.set_bind_group(1, &m.bind_group, &[]);
+                        pass.draw(it.first..it.first + it.count, 0..1);
+                    }
+                }
+                for it in gs
+                    .items
+                    .iter()
+                    .filter(|i| i.topology != DrawTopology::Triangles)
+                {
+                    pass.set_pipeline(if it.topology == DrawTopology::Lines {
+                        &p.lines
+                    } else {
+                        &p.points
+                    });
+                    pass.set_bind_group(1, &gs.materials[it.material].bind_group, &[]);
+                    pass.draw(it.first..it.first + it.count, 0..1);
+                }
+                if let Some((ibuf, _)) = &blend_buf {
+                    pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    for (mat, range) in &blend_runs {
+                        let m = &gs.materials[*mat];
+                        pass.set_pipeline(&p.blend[usize::from(!m.double_sided)]);
+                        pass.set_bind_group(1, &m.bind_group, &[]);
+                        pass.draw_indexed(range.clone(), 0, 0..1);
+                    }
+                }
+            }
+        }
+
+        // Resolve.
+        let class = match opts.shading {
+            ShadingMode::NormalDebug | ShadingMode::DepthDebug => 2,
+            _ if pbr => 0,
+            _ => 1,
+        };
+        let (tone, exposure) = if pbr {
+            (tone_map_code(opts.tone_map), opts.exposure.max(0.0))
+        } else {
+            (0, 1.0)
+        };
+        let params = ResolveParams {
+            cfg: [aa, class, tone, 0],
+            exposure: [exposure, 0.0, 0.0, 0.0],
+            background: bg,
+        };
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resolve params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resolve"),
+            layout: &self.resolve_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&targets.hdr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&targets.coverage_view),
+                },
+            ],
+        });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("scene"),
+            label: Some("resolve"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &targets.color_view,
+                view: &targets.output_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: bg[0],
-                        g: bg[1],
-                        b: bg[2],
-                        a: bg[3],
-                    }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &targets.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Discard,
-                }),
-                stencil_ops: None,
-            }),
+            depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_bind_group(0, &bind_group, &[]);
-        let fill = if wireframe {
-            None
-        } else {
-            gs.triangles.as_ref()
-        };
-        if let Some((buf, n)) = fill {
-            pass.set_pipeline(&self.tri_pipeline);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..*n, 0..1);
-        }
-        let wire = if wireframe {
-            gs.edges.as_ref().and_then(Option::as_ref)
-        } else {
-            None
-        };
-        for (buf, n) in wire.into_iter().chain(gs.lines.as_ref()) {
-            pass.set_pipeline(&self.line_pipeline);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..*n, 0..1);
-        }
+        pass.set_pipeline(&self.pipelines.resolve);
+        pass.set_bind_group(0, &resolve_bg, &[]);
+        pass.draw(0..3, 0..1);
+        Ok(())
     }
 
-    /// Draw an uploaded scene into the offscreen colour texture at
-    /// `opts.width × opts.height` (no supersampling, no readback) and
-    /// return that texture. Format is [`COLOR_FORMAT`] holding
-    /// sRGB-encoded values; usable as a copy source or sampled
-    /// texture.
-    pub(crate) fn draw(
-        &mut self,
-        gs: &mut GpuScene,
-        opts: &RenderOptions,
-    ) -> Result<&wgpu::Texture> {
-        let (width, height) = (opts.width.max(1), opts.height.max(1));
-        self.check_size(width, height)?;
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.encode_scene(&mut encoder, gs, opts, width, height);
-        self.queue.submit([encoder.finish()]);
-        Ok(&self
-            .targets
-            .as_ref()
-            .expect("targets ensured by encode_scene")
-            .color)
+    fn index_buffer(&self, idx: &[u32], label: &str) -> Option<(wgpu::Buffer, u32)> {
+        (!idx.is_empty()).then(|| {
+            let buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(idx),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            (buf, idx.len() as u32)
+        })
     }
 
+    /// Full offscreen render: prepare + upload + draw + readback.
     pub(crate) fn render(
         &mut self,
         scene: &oxideav_mesh3d::Scene3D,
         opts: &RenderOptions,
     ) -> Result<RgbaImage> {
-        let width = opts.width.max(1);
-        let height = opts.height.max(1);
-        self.check_size(width, height)?;
-        // Supersample like the scanline backend, shrinking the factor
-        // when the enlarged target would exceed the device limit.
-        let mut aa = opts.aa.clamp(1, 8);
-        while aa > 1 && (width * aa > self.max_dim || height * aa > self.max_dim) {
-            aa -= 1;
-        }
-        let (rw, rh) = (width * aa, height * aa);
-
-        let mut gs = self.upload(scene);
+        let mut gs = self.upload(scene, opts);
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.encode_scene(&mut encoder, &mut gs, opts, rw, rh);
+        self.encode_frame(&mut encoder, &mut gs, opts)?;
+        let (w, h) = (opts.width.max(1), opts.height.max(1));
 
         // Readback buffer rows must be 256-byte aligned.
-        let unpadded = rw as usize * 4;
+        let unpadded = w as usize * 4;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
         let padded = unpadded.div_ceil(align) * align;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
-            size: (padded * rh as usize) as u64,
+            size: (padded * h as usize) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let targets = self
-            .targets
-            .as_ref()
-            .expect("targets ensured by encode_scene");
+        let targets = self.targets.as_ref().expect("targets ensured");
         encoder.copy_texture_to_buffer(
-            targets.color.as_image_copy(),
+            targets.output.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded as u32),
-                    rows_per_image: Some(rh),
+                    rows_per_image: Some(h),
                 },
             },
             wgpu::Extent3d {
-                width: rw,
-                height: rh,
+                width: w,
+                height: h,
                 depth_or_array_layers: 1,
             },
         );
@@ -468,7 +684,7 @@ impl GpuContext {
         rx.recv()
             .map_err(|e| backend_err("map_async", e))?
             .map_err(|e| backend_err("map_async", e))?;
-        let mut pixels = Vec::with_capacity(unpadded * rh as usize);
+        let mut pixels = Vec::with_capacity(unpadded * h as usize);
         {
             let data = slice.get_mapped_range();
             for row in data.chunks_exact(padded) {
@@ -476,69 +692,176 @@ impl GpuContext {
             }
         }
         readback.unmap();
-
-        let full = RgbaImage {
-            width: rw,
-            height: rh,
+        Ok(RgbaImage {
+            width: w,
+            height: h,
             pixels,
             stride: unpadded,
-        };
-        Ok(if aa == 1 {
-            full
-        } else {
-            downsample_box(&full, width, height, aa)
         })
     }
+}
 
-    pub(crate) fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
-
-    pub(crate) fn queue(&self) -> &wgpu::Queue {
-        &self.queue
+fn shading_code(mode: ShadingMode) -> u32 {
+    match mode {
+        ShadingMode::Flat => 0,
+        ShadingMode::Gouraud => 1,
+        ShadingMode::Phong => 2,
+        ShadingMode::Wireframe => 3,
+        ShadingMode::NormalDebug => 4,
+        ShadingMode::DepthDebug => 5,
+        ShadingMode::Pbr => 6,
+        // Modes added later render with the physically based path.
+        _ => 6,
     }
 }
 
-/// A scene resident in GPU memory (see [`GpuContext::upload`]).
-pub(crate) struct GpuScene {
-    triangles: Option<(wgpu::Buffer, u32)>,
-    lines: Option<(wgpu::Buffer, u32)>,
-    /// Wireframe edge list, built on the first wireframe draw.
-    edges: Option<Option<(wgpu::Buffer, u32)>>,
-    cpu_triangles: Vec<Vertex>,
-    bounds: Bounds,
-}
-
-impl GpuScene {
-    pub(crate) fn triangle_count(&self) -> usize {
-        self.cpu_triangles.len() / 3
+fn tone_map_code(t: ToneMap) -> u32 {
+    match t {
+        ToneMap::Reinhard => 1,
+        ToneMap::AcesFitted => 2,
+        _ => 0,
     }
 }
 
-/// `aa × aa` box filter, the same reduction the scanline backend uses.
-fn downsample_box(src: &RgbaImage, dst_w: u32, dst_h: u32, aa: u32) -> RgbaImage {
-    let aa = aa as usize;
-    let div = (aa * aa) as u32;
-    let mut pixels = Vec::with_capacity(dst_w as usize * dst_h as usize * 4);
-    for dy in 0..dst_h as usize {
-        for dx in 0..dst_w as usize {
-            let mut acc = [0u32; 4];
-            for j in 0..aa {
-                let row = (dy * aa + j) * src.stride + dx * aa * 4;
-                for i in 0..aa {
-                    let p = row + i * 4;
-                    for (c, a) in acc.iter_mut().enumerate() {
-                        *a += src.pixels[p + c] as u32;
-                    }
-                }
-            }
-            pixels.extend(acc.map(|a| (a / div) as u8));
-        }
-    }
-    RgbaImage {
-        width: dst_w,
-        height: dst_h,
-        pixels,
-        stride: dst_w as usize * 4,
+fn build_pipelines(
+    device: &wgpu::Device,
+    globals: &wgpu::BindGroupLayout,
+    material: &wgpu::BindGroupLayout,
+    resolve: &wgpu::BindGroupLayout,
+) -> Pipelines {
+    let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("scene.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/scene.wgsl").into()),
+    });
+    let resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("resolve.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/resolve.wgsl").into()),
+    });
+    let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("scene"),
+        bind_group_layouts: &[Some(globals), Some(material)],
+        immediate_size: 0,
+    });
+    let over = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    };
+    let premultiplied_over = wgpu::BlendState {
+        color: over,
+        alpha: over,
+    };
+    let make = |label: &str,
+                topology: wgpu::PrimitiveTopology,
+                cull: Option<wgpu::Face>,
+                blend: Option<wgpu::BlendState>,
+                fs: &str| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&scene_layout),
+            vertex: wgpu::VertexState {
+                module: &scene_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &VERTEX_ATTRIBUTES,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &scene_shader,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: HDR_FORMAT,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: COVERAGE_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: cull,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(blend.is_none()),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let tri = wgpu::PrimitiveTopology::TriangleList;
+    let back = Some(wgpu::Face::Back);
+    let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("resolve"),
+        bind_group_layouts: &[Some(resolve)],
+        immediate_size: 0,
+    });
+    let resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("resolve"),
+        layout: Some(&resolve_layout),
+        vertex: wgpu::VertexState {
+            module: &resolve_shader,
+            entry_point: Some("vs_fullscreen"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &resolve_shader,
+            entry_point: Some("fs_resolve"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: COLOR_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    Pipelines {
+        opaque: [
+            make("opaque", tri, None, None, "fs_main"),
+            make("opaque-cull", tri, back, None, "fs_main"),
+        ],
+        blend: [
+            make("blend", tri, None, Some(premultiplied_over), "fs_main"),
+            make("blend-cull", tri, back, Some(premultiplied_over), "fs_main"),
+        ],
+        lines: make(
+            "lines",
+            wgpu::PrimitiveTopology::LineList,
+            None,
+            None,
+            "fs_unlit",
+        ),
+        points: make(
+            "points",
+            wgpu::PrimitiveTopology::PointList,
+            None,
+            None,
+            "fs_unlit",
+        ),
+        resolve,
     }
 }

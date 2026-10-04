@@ -16,13 +16,23 @@
 //!
 //! ## Status
 //!
-//! Phase 1: headless forward rasteriser reproducing the scanline
-//! backend's contract — Flat / Gouraud / Phong / Wireframe /
-//! NormalDebug / DepthDebug shading, perspective + orthographic
-//! framing, one directional light + ambient, supersampled AA — with
-//! hardware clipping and depth testing. PBR, textures, scene lights
-//! and cameras arrive with `oxideav-render`'s shared scene-preparation
-//! layer; hardware ray tracing is a later phase.
+//! Built on `oxideav-render`'s scene-preparation layer
+//! ([`oxideav_render::PreparedScene`]) and [`oxideav_render::Camera`],
+//! so framing, posing, materials and lights match the CPU backends:
+//!
+//! * the scanline backend's legacy modes (Flat / Gouraud / Phong /
+//!   Wireframe / NormalDebug / DepthDebug);
+//! * `Pbr`: glTF 2.0 metallic-roughness (Appendix B BRDF) with base
+//!   colour / metallic-roughness / normal / occlusion / emissive
+//!   textures, `KHR_texture_transform`, vertex colours, unlit,
+//!   OPAQUE / MASK / BLEND (per-triangle back-to-front sorting,
+//!   linear-space compositing), double-sided culling, up to 16
+//!   punctual lights (`KHR_lights_punctual` falloff), ambient, exposure
+//!   and tone mapping;
+//! * a scene-linear `Rgba16Float` pass resolved (tone map, background
+//!   composite, supersample average, sRGB encode) on the GPU.
+//!
+//! Shadow maps and hardware ray tracing are later phases.
 //!
 //! ```no_run
 //! use oxideav_render::{RenderOptions, Renderer};
@@ -37,12 +47,10 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-mod camera;
-mod flatten;
 mod gpu;
-mod math;
+mod scene;
 
-use oxideav_render::{RenderOptions, RenderRegistry, Renderer, Result, RgbaImage};
+use oxideav_render::{RenderOptions, RenderRegistry, Renderer, Result, RgbaImage, TextureResolver};
 
 pub use oxideav_render::Error;
 
@@ -54,12 +62,12 @@ pub const CRATE_NAME: &str = "oxideav-render-vulkan";
 pub const COLOR_FORMAT: wgpu::TextureFormat = gpu::COLOR_FORMAT;
 
 /// A scene resident in GPU memory, created by [`GpuRenderer::upload`].
-pub struct GpuScene(gpu::GpuScene);
+pub struct GpuScene(scene::GpuScene);
 
 impl GpuScene {
     /// Number of triangles uploaded.
     pub fn triangle_count(&self) -> usize {
-        self.0.triangle_count()
+        self.0.triangle_count
     }
 }
 
@@ -129,13 +137,25 @@ impl GpuRenderer {
     /// Upload `scene` to GPU memory once so it can be redrawn cheaply
     /// with different options (interactive viewers: orbit, zoom,
     /// shading-mode switches). Re-upload when the scene changes.
-    pub fn upload(&self, scene: &oxideav_mesh3d::Scene3D) -> GpuScene {
-        GpuScene(self.ctx.upload(scene))
+    ///
+    /// Upload-time options: `time` / `animation` (pose), and
+    /// `material_variant`. Everything else (camera, shading, lights,
+    /// tone mapping, size, AA) is read at [`GpuRenderer::draw`] time.
+    pub fn upload(&mut self, scene: &oxideav_mesh3d::Scene3D, opts: &RenderOptions) -> GpuScene {
+        GpuScene(self.ctx.upload(scene, opts))
     }
 
-    /// Draw an uploaded scene at `opts.width × opts.height` into the
-    /// renderer's offscreen colour texture and return it — no
-    /// supersampling, no CPU readback. The texture has format
+    /// Install the resolver used to decode texture images (e.g.
+    /// `oxideav_render::RegistryTextureResolver` over the framework's
+    /// codec registry). Without one, only raw `RAW_RGBA8_MIME`
+    /// payloads decode and other textured materials render untextured.
+    pub fn set_texture_resolver(&mut self, resolver: std::sync::Arc<dyn TextureResolver>) {
+        self.ctx.texture_cache_mut().set_resolver(resolver);
+    }
+
+    /// Draw an uploaded scene at `opts.width × opts.height`
+    /// (supersampled by `opts.aa`) into the renderer's offscreen colour
+    /// texture and return it — no CPU readback. The texture has format
     /// [`COLOR_FORMAT`] and holds **sRGB-encoded** values (the shader
     /// encodes); it supports `COPY_SRC` and `TEXTURE_BINDING`, so a
     /// viewer can copy or sample it onto its surface. The work is
