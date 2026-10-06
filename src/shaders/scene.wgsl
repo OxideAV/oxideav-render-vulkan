@@ -294,7 +294,11 @@ fn shade_pbr(in: VsOut, front: bool) -> vec4<f32> {
     var alpha = base.a;
     if (m.flags.y == 1u) {
         if (alpha < m.emissive.w) {
-            discard;
+            // MASK cut-out. Signalled to the entry point (negative
+            // alpha) rather than `discard`ed here: FXC (the D3D12 HLSL
+            // compiler) rejects a helper whose only exit on a path is
+            // a `discard` ("not all control paths return a value").
+            return vec4<f32>(0.0, 0.0, 0.0, -1.0);
         }
         alpha = 1.0;
     } else if (m.flags.y == 0u) {
@@ -384,7 +388,11 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> FsOut {
             out.color = vec4<f32>(d, d, d, 1.0);
         }
         case 6u: {
-            out.color = shade_pbr(in, front);
+            let c = shade_pbr(in, front);
+            if (c.a < 0.0) {
+                discard;
+            }
+            out.color = c;
         }
         default: {
             out.color = m.base_color;

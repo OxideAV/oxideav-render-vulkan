@@ -1,11 +1,10 @@
 //! Shared GPU-test gating.
 //!
-//! GPU tests run on hardware adapters. Software rasterisers
-//! (`wgpu::DeviceType::Cpu`: WARP on Windows CI runners, llvmpipe /
-//! lavapipe on Linux) are skipped by default: they are slow, and WARP
-//! has been seen to crash (access violation) when several test threads
-//! drive it at once, which no test can catch. Set
-//! `OXIDEAV_GPU_TESTS=software` to run on them anyway, or
+//! GPU tests run on any adapter wgpu finds, software rasterisers
+//! included (`wgpu::DeviceType::Cpu`: WARP on the Windows CI runners,
+//! llvmpipe / lavapipe on Linux). WARP is how CI exercises the D3D12
+//! backend and its FXC shader compiler, so it is kept on by default.
+//! Set `OXIDEAV_GPU_TESTS=hardware` to skip software adapters, or
 //! `OXIDEAV_GPU_TESTS=off` to skip every GPU test.
 
 #![allow(dead_code)]
@@ -30,13 +29,19 @@ fn decide() -> bool {
             eprintln!("skipping GPU test: no adapter");
             false
         }
-        Some(info) if info.device_type == wgpu::DeviceType::Cpu && mode != "software" => {
+        Some(info) if info.device_type == wgpu::DeviceType::Cpu && mode == "hardware" => {
             eprintln!(
-                "skipping GPU test: software adapter {} ({:?}); set OXIDEAV_GPU_TESTS=software to run",
+                "skipping GPU test: software adapter {} ({:?}) with OXIDEAV_GPU_TESTS=hardware",
                 info.name, info.backend
             );
             false
         }
-        Some(_) => true,
+        Some(info) => {
+            eprintln!(
+                "GPU test on {} ({:?}, {:?})",
+                info.name, info.device_type, info.backend
+            );
+            true
+        }
     }
 }
