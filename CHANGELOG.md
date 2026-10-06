@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-render-vulkan/compare/v0.0.1...v0.0.2) - 2026-10-06
+
+### Fixed
+
+- capture internal errors from shader compilers; from_device returns Result
+- *(shader)* no discard inside shade_pbr (FXC: not all control paths return)
+- serialise wgpu instance/adapter/device creation; skip GPU tests on software adapters
+
 ### Changed
 
 - `GpuRenderer::from_device` now returns `Result<Self>`: pipeline
