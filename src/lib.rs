@@ -171,8 +171,16 @@ impl GpuRenderer {
 
     /// Build the renderer on an existing wgpu device — lets a windowed
     /// application (e.g. oxideplay) share its device with the renderer.
-    pub fn from_device(device: wgpu::Device, queue: wgpu::Queue, info: wgpu::AdapterInfo) -> Self {
-        Self::wrap(gpu::GpuContext::from_device(device, queue, info))
+    /// Fails with [`Error::Backend`] when the device's shader compiler
+    /// rejects the raster pipelines.
+    pub fn from_device(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        info: wgpu::AdapterInfo,
+    ) -> Result<Self> {
+        Ok(Self::wrap(gpu::GpuContext::from_device(
+            device, queue, info,
+        )?))
     }
 
     fn wrap(ctx: gpu::GpuContext) -> Self {
@@ -257,6 +265,11 @@ impl GpuRenderer {
     /// The wgpu queue the renderer submits to.
     pub fn queue(&self) -> &wgpu::Queue {
         self.ctx.queue()
+    }
+
+    /// The adapter the renderer's device was created on.
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        self.ctx.adapter_info()
     }
 
     /// Human-readable adapter description: `"<name> (<device type>,

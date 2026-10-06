@@ -327,6 +327,11 @@ impl GpuPathTracer {
         info: wgpu::AdapterInfo,
     ) -> Result<Self> {
         check_limits(&device)?;
+        // Capture both validation and internal errors: a backend shader
+        // compiler rejecting the kernel (e.g. D3D12's FXC failing to
+        // unroll a loop) is reported as an *internal* error, which would
+        // otherwise reach wgpu's default handler and panic.
+        let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let cs = wgpu::ShaderStages::COMPUTE;
         let fs = wgpu::ShaderStages::FRAGMENT;
@@ -417,7 +422,9 @@ impl GpuPathTracer {
         };
         let resolve_color = resolve_for(COLOR_FORMAT);
         let resolve_hdr = resolve_for(HDR_OUT_FORMAT);
-        if let Some(e) = pollster::block_on(scope.pop()) {
+        let validation = pollster::block_on(scope.pop());
+        let internal = pollster::block_on(internal_scope.pop());
+        if let Some(e) = validation.or(internal) {
             return Err(backend_err("path tracer pipelines", e));
         }
         Ok(Self {

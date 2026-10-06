@@ -150,7 +150,7 @@ impl GpuContext {
     /// Open an adapter + device headlessly (no surface).
     pub(crate) fn new(backend: GpuBackend) -> Result<Self> {
         let (device, queue, info) = open_device_blocking(backend)?;
-        Ok(Self::from_device(device, queue, info))
+        Self::from_device(device, queue, info)
     }
 
     /// Build pipelines on an existing device (e.g. one shared with a
@@ -159,7 +159,13 @@ impl GpuContext {
         device: wgpu::Device,
         queue: wgpu::Queue,
         adapter_info: wgpu::AdapterInfo,
-    ) -> Self {
+    ) -> Result<Self> {
+        // Shader / pipeline failures (validation, or a backend compiler
+        // rejecting a shader, reported as an internal error) become
+        // `Error::Backend` instead of reaching wgpu's panicking default
+        // error handler.
+        let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let max_dim = device.limits().max_texture_dimension_2d;
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
@@ -229,7 +235,7 @@ impl GpuContext {
             [&empty_layout, &shadow_pass_layout],
         );
         let cache = ResourceCache::new(&device, &queue);
-        Self {
+        let ctx = Self {
             device,
             queue,
             adapter_info,
@@ -244,6 +250,12 @@ impl GpuContext {
             targets: None,
             shadow_targets: None,
             texture_cache: TextureCache::default(),
+        };
+        let validation = pollster::block_on(validation_scope.pop());
+        let internal = pollster::block_on(internal_scope.pop());
+        match validation.or(internal) {
+            Some(e) => Err(backend_err("raster pipelines", e)),
+            None => Ok(ctx),
         }
     }
 

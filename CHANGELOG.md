@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `GpuRenderer::from_device` now returns `Result<Self>`: pipeline
+  creation runs under validation + internal error scopes, so a shader
+  the backend compiler rejects becomes `Error::Backend` instead of a
+  panic in wgpu's default error handler (also for `GpuPathTracer`).
+
+### Fixed
+
+- D3D12 / FXC: `shade_pbr` no longer `discard`s inside a helper
+  function ("not all control paths return a value").
+
 ## [0.0.1](https://github.com/OxideAV/oxideav-render-vulkan/compare/v0.0.0...v0.0.1) - 2026-10-04
 
 ### Added
