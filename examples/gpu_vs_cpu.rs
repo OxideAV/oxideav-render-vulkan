@@ -9,8 +9,8 @@ use oxideav_mesh3d::{
     Material, MaterialId, Mesh, MeshId, Node, NodeId, Primitive, Scene3D, Topology,
 };
 use oxideav_render::{
-    make_renderer, BackgroundColor, CameraSpec, RenderBackend, RenderOptions, Renderer, RgbaImage,
-    ShadingMode,
+    BackgroundColor, CameraSpec, RenderBackend, RenderOptions, Renderer, RgbaImage, ShadingMode,
+    make_renderer,
 };
 use oxideav_render_vulkan::GpuRenderer;
 
@@ -48,7 +48,7 @@ fn sphere(segments: u32, rings: u32) -> Primitive {
 
 fn write_ppm(path: &std::path::Path, img: &RgbaImage) -> std::io::Result<()> {
     let mut out = format!("P6\n{} {}\n255\n", img.width, img.height).into_bytes();
-    for p in img.pixels.chunks_exact(4) {
+    for p in img.pixels.as_chunks::<4>().0 {
         out.extend_from_slice(&p[..3]);
     }
     std::fs::write(path, out)

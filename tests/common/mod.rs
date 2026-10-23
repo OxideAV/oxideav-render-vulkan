@@ -9,7 +9,7 @@
 
 #![allow(dead_code)]
 
-use oxideav_render_vulkan::{probe_adapter, GpuBackend};
+use oxideav_render_vulkan::{GpuBackend, probe_adapter};
 
 /// Whether GPU tests should run on this machine. Prints the reason
 /// when they are skipped.

@@ -6,7 +6,7 @@ mod common;
 use oxideav_mesh3d::{Sampler, Scene3D};
 use oxideav_render::testscenes::{self, mean_abs_error, psnr};
 use oxideav_render::{
-    make_renderer, BackgroundColor, RenderBackend, RenderOptions, Renderer, ShadingMode,
+    BackgroundColor, RenderBackend, RenderOptions, Renderer, ShadingMode, make_renderer,
 };
 use oxideav_render_vulkan::GpuRenderer;
 
@@ -40,7 +40,7 @@ fn compare(name: &str, scene: &Scene3D, o: &RenderOptions, min_psnr: f64) {
     if let Ok(dir) = std::env::var("OXIDEAV_PARITY_DUMP") {
         for (tag, img) in [("gpu", &g), ("cpu", &c)] {
             let mut out = format!("P6\n{} {}\n255\n", img.width, img.height).into_bytes();
-            for px in img.pixels.chunks_exact(4) {
+            for px in img.pixels.as_chunks::<4>().0 {
                 out.extend_from_slice(&px[..3]);
             }
             std::fs::write(format!("{dir}/{name}-{tag}.ppm"), out).unwrap();

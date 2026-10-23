@@ -63,8 +63,8 @@ use std::sync::Arc;
 
 use oxideav_mesh3d::{AlphaMode, MagFilter, MinFilter, Scene3D, WrapMode};
 use oxideav_render::pathtrace::{
-    radiance_key, sheen_albedo_table, sobol_direction_numbers, EmissiveLights, EnvironmentMap,
-    SHEEN_LUT_COS, SHEEN_LUT_ROUGH,
+    EmissiveLights, EnvironmentMap, SHEEN_LUT_COS, SHEEN_LUT_ROUGH, radiance_key,
+    sheen_albedo_table, sobol_direction_numbers,
 };
 use oxideav_render::prepare::{DrawItem, LightKind, PrepareOptions, TextureBinding};
 use oxideav_render::texture::{ColorSpace, TextureData};
@@ -75,7 +75,7 @@ use oxideav_render::{
 };
 use wgpu::util::DeviceExt;
 
-use crate::gpu::{backend_err, readback_texture, COLOR_FORMAT};
+use crate::gpu::{COLOR_FORMAT, backend_err, readback_texture};
 use crate::scene::f32_to_f16;
 
 const _: () = assert!(SHEEN_LUT_COS == 32 && SHEEN_LUT_ROUGH == 16);
@@ -715,7 +715,9 @@ impl GpuPathTracer {
             width: w,
             height: h,
             pixels: bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect(),
         })
@@ -1028,12 +1030,12 @@ impl GpuPathTracer {
         let mut atlas = AtlasBuilder::new(&self.device);
         let mut descs: HashMap<(usize, bool), u32> = HashMap::new();
         let mut want = |b: &Option<TextureBinding>, space: ColorSpace| {
-            if let Some(b) = b {
-                if prepared.texture(b).is_some() {
-                    descs
-                        .entry((b.texture, space == ColorSpace::Srgb))
-                        .or_insert(0);
-                }
+            if let Some(b) = b
+                && prepared.texture(b).is_some()
+            {
+                descs
+                    .entry((b.texture, space == ColorSpace::Srgb))
+                    .or_insert(0);
             }
         };
         let ext_bindings = |m: &oxideav_render::prepare::PreparedMaterial| {

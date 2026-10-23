@@ -9,7 +9,7 @@ use oxideav_mesh3d::{
     AlphaMode, ImageData, InMemoryAsset, MagFilter, Material, MaterialId, Mesh, MeshId, MinFilter,
     Node, NodeId, Primitive, Sampler, Scene3D, Texture, TextureId, TextureRef, Topology,
 };
-use oxideav_render::texture::{encode_raw_rgba8, RAW_RGBA8_MIME};
+use oxideav_render::texture::{RAW_RGBA8_MIME, encode_raw_rgba8};
 use oxideav_render::{BackgroundColor, RenderOptions, Renderer, RgbaImage, ShadingMode, ToneMap};
 use oxideav_render_vulkan::GpuRenderer;
 
@@ -72,7 +72,13 @@ fn centre(img: &RgbaImage) -> [u8; 4] {
 }
 
 fn mean_luma(img: &RgbaImage) -> f64 {
-    let px: Vec<_> = img.pixels.chunks_exact(4).filter(|p| p != &BG).collect();
+    let px: Vec<_> = img
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| **p != BG)
+        .collect();
     px.iter()
         .map(|p| p[0] as f64 + p[1] as f64 + p[2] as f64)
         .sum::<f64>()
@@ -142,7 +148,7 @@ fn mask_below_cutoff_is_discarded() {
     };
     let s = scene(vec![quad(0.0, 0.5, 0)], vec![mat]);
     let img = r.render(&s, &opts()).unwrap();
-    assert!(img.pixels.chunks_exact(4).all(|p| p == BG));
+    assert!(img.pixels.as_chunks::<4>().0.iter().all(|p| *p == BG));
 }
 
 #[test]

@@ -5,8 +5,8 @@ mod common;
 
 use oxideav_mesh3d::{Material, MaterialId, Mesh, MeshId, Node, Primitive, Scene3D, Topology};
 use oxideav_render::{
-    make_renderer, BackgroundColor, CameraSpec, RenderBackend, RenderOptions, Renderer, RgbaImage,
-    ShadingMode,
+    BackgroundColor, CameraSpec, RenderBackend, RenderOptions, Renderer, RgbaImage, ShadingMode,
+    make_renderer,
 };
 use oxideav_render_vulkan::GpuRenderer;
 
@@ -96,8 +96,10 @@ fn opts(shading: ShadingMode) -> RenderOptions {
 
 fn coverage(img: &RgbaImage) -> Vec<bool> {
     img.pixels
-        .chunks_exact(4)
-        .map(|p| p != [255, 255, 255, 255])
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| *p != [255, 255, 255, 255])
         .collect()
 }
 
@@ -170,9 +172,15 @@ fn phong_shading_is_close_to_scanline() {
     let mut worst = 0i32;
     let mut sum = 0u64;
     let mut n = 0u64;
-    for (pg, pc) in g.pixels.chunks_exact(4).zip(c.pixels.chunks_exact(4)) {
+    for (pg, pc) in g
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(c.pixels.as_chunks::<4>().0.iter())
+    {
         let bg = [255, 255, 255, 255];
-        if pg == bg || pc == bg {
+        if *pg == bg || *pc == bg {
             continue;
         }
         for k in 0..3 {
@@ -206,10 +214,13 @@ fn empty_scene_is_background() {
     let img = r
         .render(&Scene3D::new(), &opts(ShadingMode::Phong))
         .unwrap();
-    assert!(img
-        .pixels
-        .chunks_exact(4)
-        .all(|p| p == [255, 255, 255, 255]));
+    assert!(
+        img.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [255, 255, 255, 255])
+    );
 }
 
 #[test]

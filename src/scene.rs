@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use oxideav_mesh3d::{AlphaMode, MagFilter, MinFilter, Sampler, WrapMode};
+use oxideav_render::PreparedScene;
 use oxideav_render::prepare::{DrawTopology, PreparedLight, PreparedMaterial, TextureBinding};
 use oxideav_render::texture::{ColorSpace, TextureData};
-use oxideav_render::PreparedScene;
 use wgpu::util::DeviceExt;
 
 /// One GPU vertex (72 bytes).

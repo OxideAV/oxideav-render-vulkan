@@ -73,7 +73,7 @@ fn dump(name: &str, imgs: &[(&str, &RgbaImage)]) {
     if let Ok(dir) = std::env::var("OXIDEAV_PARITY_DUMP") {
         for (tag, img) in imgs {
             let mut out = format!("P6\n{} {}\n255\n", img.width, img.height).into_bytes();
-            for px in img.pixels.chunks_exact(4) {
+            for px in img.pixels.as_chunks::<4>().0 {
                 out.extend_from_slice(&px[..3]);
             }
             std::fs::write(format!("{dir}/pt-{name}-{tag}.ppm"), out).unwrap();
@@ -504,8 +504,14 @@ fn uncovered_pixels_keep_background_bytes() {
     let gi = g.render(&scene, &o).unwrap();
     let ci = PathTraceRenderer::new().render(&scene, &o).unwrap();
     let mut bg = 0;
-    for (a, b) in gi.pixels.chunks_exact(4).zip(ci.pixels.chunks_exact(4)) {
-        if b == [37, 99, 201, 180] {
+    for (a, b) in gi
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(ci.pixels.as_chunks::<4>().0.iter())
+    {
+        if *b == [37, 99, 201, 180] {
             assert_eq!(a, b);
             bg += 1;
         }
@@ -549,7 +555,13 @@ fn empty_scene_is_all_background() {
     o.scene_camera = None;
     o.background = BackgroundColor([1, 2, 3, 4]);
     let img = g.render(&Scene3D::new(), &o).unwrap();
-    assert!(img.pixels.chunks_exact(4).all(|p| p == [1, 2, 3, 4]));
+    assert!(
+        img.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [1, 2, 3, 4])
+    );
 }
 
 #[test]

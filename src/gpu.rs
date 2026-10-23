@@ -13,10 +13,10 @@ use oxideav_render::{
 };
 use wgpu::util::DeviceExt;
 
-use crate::scene::{
-    material_layout, GpuScene, Pass, ResourceCache, Uploader, Vertex, VERTEX_ATTRIBUTES,
-};
 use crate::GpuBackend;
+use crate::scene::{
+    GpuScene, Pass, ResourceCache, Uploader, VERTEX_ATTRIBUTES, Vertex, material_layout,
+};
 
 /// Output format of the resolve pass (holds sRGB-encoded values).
 pub(crate) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -456,27 +456,28 @@ impl GpuContext {
         let mut shadow_uniforms = [ShadowUniform::default(); MAX_SHADOWS];
         let mut shadow_setups = Vec::new();
         let shadow_size = opts.shadow_map_size.clamp(16, 8192).min(self.max_dim);
-        if pbr && opts.shadows {
-            if let Some(bounds) = gs.prepared.bounds() {
-                for (li, l) in lights.iter().enumerate().take(MAX_LIGHTS) {
-                    if shadow_setups.len() == MAX_SHADOWS {
-                        break;
-                    }
-                    if let Some(sh) = crate::shadow::setup(l, bounds, shadow_size) {
-                        let layer = shadow_setups.len();
-                        light_uniforms[li].cone[2] = layer as f32;
-                        shadow_uniforms[layer] = ShadowUniform {
-                            view_proj: crate::shadow::column_major(&sh.view_proj),
-                            eye_texel: [sh.eye[0], sh.eye[1], sh.eye[2], sh.texel],
-                            dir_persp: [
-                                sh.dir[0],
-                                sh.dir[1],
-                                sh.dir[2],
-                                sh.perspective as u32 as f32,
-                            ],
-                        };
-                        shadow_setups.push(sh);
-                    }
+        if pbr
+            && opts.shadows
+            && let Some(bounds) = gs.prepared.bounds()
+        {
+            for (li, l) in lights.iter().enumerate().take(MAX_LIGHTS) {
+                if shadow_setups.len() == MAX_SHADOWS {
+                    break;
+                }
+                if let Some(sh) = crate::shadow::setup(l, bounds, shadow_size) {
+                    let layer = shadow_setups.len();
+                    light_uniforms[li].cone[2] = layer as f32;
+                    shadow_uniforms[layer] = ShadowUniform {
+                        view_proj: crate::shadow::column_major(&sh.view_proj),
+                        eye_texel: [sh.eye[0], sh.eye[1], sh.eye[2], sh.texel],
+                        dir_persp: [
+                            sh.dir[0],
+                            sh.dir[1],
+                            sh.dir[2],
+                            sh.perspective as u32 as f32,
+                        ],
+                    };
+                    shadow_setups.push(sh);
                 }
             }
         }
@@ -946,7 +947,9 @@ impl GpuContext {
             width: w,
             height: h,
             pixels: bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect(),
         })
