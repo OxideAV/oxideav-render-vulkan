@@ -132,6 +132,7 @@ struct ResolveParams {
 
 /// Which pipeline [`crate::GpuRenderer`] renders with.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum GpuMode {
     /// The forward rasteriser (all shading modes, shadow maps).
     #[default]

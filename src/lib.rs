@@ -118,6 +118,7 @@ pub const PATHTRACE_BACKEND_NAME: &str = "gpu-pathtrace";
 
 /// Which wgpu backend to open.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum GpuBackend {
     /// Let wgpu pick the best available API (Vulkan / Metal / DX12,
     /// then OpenGL).
